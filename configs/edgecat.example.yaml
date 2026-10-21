@@ -1,0 +1,44 @@
+﻿# EdgeCat - Local-First AI Inference Governance Gateway
+# Copyright (c) 2026 Guo Qiang. Distributed under Apache-2.0.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_ms: 30000
+  write_timeout_ms: 120000
+
+local:
+  endpoint: "http://127.0.0.1:11434/v1"
+  api_key: ""
+  max_concurrent_local: 2
+  ttft_timeout_ms: 3500
+  model_mapping:
+    "default": "qwen2.5:7b"
+    "gpt-4o-mini": "qwen2.5:7b"
+    "qwen2.5:7b": "qwen2.5:7b"
+
+cloud:
+  endpoint: "https://api.openai.com/v1"
+  api_key: "sk-your-cloud-api-key"
+  timeout_ms: 60000
+  model_mapping:
+    "default": "gpt-4o-mini"
+    "qwen2.5:7b": "gpt-4o-mini"
+
+filter:
+  enabled: true
+  mask_phone: true
+  mask_email: true
+  mask_ipv4: true
+  mask_apikey: true
+
+contract:
+  strict_json_enabled: true
+  max_repair_attempts: 1
+  repair_timeout_ms: 5000
+
+audit:
+  sqlite_path: "data/edgecat_audit.db"
+  batch_size: 50
+  flush_interval_ms: 1000
+  queue_size: 10000
