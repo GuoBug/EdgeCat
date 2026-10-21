@@ -1,24 +1,29 @@
-# EdgeCat: 本地优先 (Local-First) AI 推理治理网关
+# EdgeCat: Local-First AI Inference Governance Gateway
+
+<p align="center">
+  <b>English</b> •
+  <a href="README_zh.md">中文</a>
+</p>
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![CGO_ENABLED](https://img.shields.io/badge/CGO_ENABLED-0-success?style=flat)]()
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Local--First_Dual--Track-orange)]()
 
-> **EdgeCat** 是一个轻量级、确定性、本地优先的 AI 推理治理网关，使用 Go 1.22+ 编写并实现 `CGO_ENABLED=0` 纯静态编译。  
-> 专为解决边缘/本地模型（如 Ollama、vLLM、llama.cpp）与云端保底端点之间的流式治理、敏感信息过滤、冷启动超时熔断及审计入库而构建。
+> **EdgeCat** is an ultra-lightweight, deterministic, local-first AI inference governance gateway written in Go 1.22+ and compiled with `CGO_ENABLED=0` pure static binaries.  
+> Purpose-built to solve real-world engineering bottlenecks when bridging local edge inference engines (Ollama, vLLM, llama.cpp) with cloud fallback tiers (OpenAI, DeepSeek, Qwen).
 
 ---
 
-## 核心痛点与工程解法
+## Core Pain Points & Engineering Solutions
 
-在传统的 AI 应用架构中，将请求直接打到本地推理端点往往面临四大工程痛点：
-1. **GPU 负载与假死难以从 OS 内存判断**：本地模型排队卡死时，下游客户端无限挂起；
-2. **跨 Chunk 的 PII 还原丢失**：流式 SSE 返回时，占位符被 Token 切片拆分（例如 `{{EC_PII_` 与 `PHONE_1}}` 落在不同数据包），常规正则还原直接失效；
-3. **输出格式失控**：模型常常无视 `response_format` 强行包裹 ````json 代码块，破坏下游反序列化契约；
-4. **同步写日志拖慢推理延迟**：传统网关在 HTTP 协程中同步写入数据库，导致首字耗时（TTFT）劣化。
+In local-first and hybrid AI architectures, dispatching traffic directly to local GPU workers introduces four severe operational hazards:
+1. **Unreliable GPU Hang Detection**: Operating system memory metrics cannot reliably reflect GPU saturation; stalled local inference hangs downstream client connections indefinitely.
+2. **PII Placeholder Fragmentation Across SSE Chunks**: When streaming tokens over Server-Sent Events (SSE), deterministic placeholders are frequently split across token chunk boundaries (e.g., `{{EC_PII_` in Chunk 1 and `PHONE_1}}` in Chunk 2), causing naive regex rehydration to fail.
+3. **Contract Drift & Code Fence Violations**: Local LLMs often ignore `response_format` and wrap outputs in unwanted ````json markdown code blocks, breaking downstream strict serialization contracts.
+4. **Synchronous Audit Latency Penalties**: Traditional gateways write audit logs directly within the HTTP request goroutine, causing severe Time-To-First-Token (TTFT) degradation.
 
-**EdgeCat 通过以下五大确定性机制彻底化解上述痛点：**
+**EdgeCat eliminates these failure modes through five deterministic mechanisms:**
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -61,50 +66,51 @@
 
 ---
 
-## 五大核心架构支柱
+## Key Architectural Pillars
 
-### 1. 滑动窗口流式还原 (Sliding-Window SSE Rehydration)
-- **掩码阶段**：请求进入时，提取手机号、邮箱、内网 IPv4 及各类 API Key，替换为确定性占位符 `{{EC_PII_<TYPE>_<INDEX>}}`（同值去重，保持上下文一致性），原值隔离保存在当前 Context 的 `Vault` 中。
-- **流式拼接**：设计了双游标轻量级滑动窗口缓冲器。当检测到未闭合的占位符前缀（如 `{{EC_` 或 `{{EC_PII_`）时，网关将截断部分暂存至 `pending` 缓冲区，前序安全内容即刻刷出；下一 Chunk 到达拼接闭合后，完成替换再向下游 `http.Flusher` 输出，完美解决 Token 分词跨 Chunk 截断痛点。
+### 1. Sliding-Window SSE Rehydration
+- **Ingress Masking**: Inbound requests are scanned for Chinese/international mobile numbers, email addresses, private IPv4 subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8), and API keys. Sensitive entities are substituted with deterministic tokens `{{EC_PII_<TYPE>_<INDEX>}}` and stored in a request-scoped in-memory `Vault`.
+- **Egress Rehydration**: Implements a dual-cursor sliding-window streaming buffer. If an unclosed placeholder prefix (such as `{{EC_` or `{{EC_PII_`) is detected at the tail of an incoming chunk, the gateway holds back the unclosed slice in a lightweight pending buffer while flushing safe leading tokens immediately. Once subsequent chunks close the placeholder, the original value is restored and flushed via `http.Flusher`.
 
-### 2. 并发信号量与 TTFT 首字超时降级 (Circuit Breaker & Fallback)
-- 不依赖模糊的操作系统 GPU/内存指标，采用带权通道信号量管理本地最大并发数（`max_concurrent_local`）。
-- 建立独立的 **TTFT（Time-To-First-Token）首字看门狗**：在向本地发起请求时启动计时器。若本地并发满载、网络拒连或超出 `ttft_timeout_ms` 未吐出首个有效 Byte/Chunk，网关在向客户端输出任何内容前立即触发静默熔断，无缝重写请求转交云端保底端点（Cloud Tier）。
+### 2. Concurrency Semaphore & TTFT Watchdog Fallback
+- Replaces OS memory guesswork with a strict channel semaphore (`chan struct{}`) bounded by `max_concurrent_local`.
+- Incorporates a **Time-To-First-Token (TTFT) Circuit Breaker**: when dispatching to the local worker, an independent timer monitors the first byte/chunk. If local concurrency is saturated, connections are refused, or TTFT exceeds `ttft_timeout_ms`, the gateway silently cancels the local context, releases the semaphore, and re-routes the redacted payload to the Cloud Fallback Tier **before any headers are flushed to the client**.
 
-### 3. 模型别名动态重写 (Model Aliasing)
-- 客户端无需感知底层模型差异，统一请求 `default` 或 `gpt-4o-mini`。
-- 路由至 Local Tier 时自动重写为配置的本地模型名（如 `qwen2.5:7b`），降级至 Cloud Tier 时重写为云端模型名，并正确重新计算 HTTP `Content-Length` 与路由标头。
+### 3. Transparent Model Aliasing
+- Upstream applications use unified logical names (e.g., `default` or `gpt-4o-mini`).
+- EdgeCat dynamically rewrites the request model: mapping to the configured local model (`qwen2.5:7b`) on the local tier, or the cloud model on fallback, with automatic recalculation of HTTP `Content-Length`.
 
-### 4. 契约校验与单次自修复闭环 (Strict JSON Guard & Repair Loop)
-- 当请求包含 `response_format: {"type": "json_object"}` 或标头 `X-EdgeCat-Strict-JSON: true` 时，自动剥离输出中多余的 ````json / ```` Markdown 代码块标签与空白注释。
-- 若提取后校验仍不合法，受控触发最多 1 次单轮 Prompt 修复调用（带超时限制），杜绝递归死循环。
+### 4. Strict JSON Contract Guard & Bounded Repair Loop
+- When `response_format: {"type": "json_object"}` or header `X-EdgeCat-Strict-JSON: true` is present, the gateway automatically strips markdown fences (````json ... ````) and cleans trailing whitespace.
+- If syntax validation fails, EdgeCat initiates at most **one bounded repair call** under strict timeout to prompt the model for valid JSON, preventing runaway recursion.
 
-### 5. 无锁异步 SQLite 批量审计 (Async Batch SQLite Logger)
-- 引入纯 Go 编写的 `modernc.org/sqlite`，连接初始化时显式开启 `_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)`。
-- HTTP 协程仅需向有界 Channel（默认 10,000 容量）发送审计条目，耗时趋近于 0，写满时自动丢弃保护低延迟；后台唯一 Worker 协程按批量阈值（如 50 条）或定时器聚合单事务落库。
+### 5. Lock-Free Asynchronous SQLite Batch Audit
+- Powered by `modernc.org/sqlite` (pure Go, zero CGO). Uses `_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)` for high-throughput single-writer performance.
+- HTTP handlers push audit entries (`RequestID`, `RouteTarget`, `Model`, `LatencyMs`, `TTFTMs`, `PIIRedactedCount`, `Status`) into a bounded channel (capacity 10,000) using a non-blocking `select-default` pattern. A dedicated background worker flushes batches by threshold (50 items) or ticker interval.
 
 ---
 
-## 快速上手
+## Quickstart
 
-### 1. 编译
-本项目完全支持 `CGO_ENABLED=0` 纯静态编译：
+### 1. Build
+EdgeCat supports 100% CGO-free static compilation:
 ```bash
-# 生成纯静态无依赖可执行文件
+# Using Makefile
 make build
-# 或直接执行：
+
+# Or direct Go build:
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/edgecat ./cmd/edgecat
 ```
 
-### 2. 运行单元测试
+### 2. Run Test Suite
 ```bash
 make test
-# 或执行：
+# Or execute:
 go test -v ./...
 ```
 
-### 3. 配置与启动
-参考 `configs/edgecat.example.yaml` 编写配置文件：
+### 3. Configuration & Startup
+Review `configs/edgecat.example.yaml`:
 ```yaml
 server:
   host: "0.0.0.0"
@@ -143,33 +149,33 @@ audit:
   flush_interval_ms: 1000
 ```
 
-启动网关：
+Start the gateway:
 ```bash
 ./bin/edgecat -config configs/edgecat.example.yaml
 ```
 
 ---
 
-## 接口说明
+## Endpoints
 
-EdgeCat 100% 兼容 OpenAI ChatCompletion 协议：
-- **`POST /v1/chat/completions`**：支持标准 JSON 及 SSE 流式（`stream: true`）传输。
-- **`GET /health`**：实时返回本地/云端端点状态、本地活动信号量并发数、累计降级次数以及异步审计日志吞吐指标。
-- **`GET /v1/models`**：提供 OpenAI 兼容的模型列表发现。
-
----
-
-## 人机协同与演进理念 (Collaboration Note)
-
-本项目由作者 **Guo Qiang** 借助 AI Pair Programming（人机结对共创）通过“干中学（Learning by Doing）”模式探索落地：
-- **人提的关键点**：来源于真实生产场景中本地大模型“首字卡死无限等待”、“单机 GPU 显存过载崩溃”以及“私有数据流式送模泄露”等系统痛点；
-- **AI 提的关键点**：聚焦于“滑动窗口双游标状态机”、“SSE 跨分包占位符拆分防丢”、“HTTP 流式劫持与未刷 Header 前静默降级”及“WAL 模式下 SQLite 单协程批量写入无锁优化”。
-
-欢迎对 AI 边缘网关、确定性工作流以及系统工程感兴趣的同行与架构师交流指教！
+EdgeCat provides full OpenAI API wire compatibility:
+- **`POST /v1/chat/completions`**: Supports both standard JSON payloads and real-time SSE streaming (`stream: true`).
+- **`GET /health`**: Returns real-time health metrics, active concurrency slots, fallback statistics, and audit pipeline throughput.
+- **`GET /v1/models`**: OpenAI-compatible model catalog discovery.
 
 ---
 
-> **关于作者**  
-> **郭强 (GuoBug)**，Product Engineer，做平台工程也做业务增长。目前主要在折腾 AI 工作流编排、DAG 状态机与确定性系统架构。  
-> 开源项目与主页：[https://github.com/GuoBug](https://github.com/GuoBug) · [https://guobug.github.io](https://guobug.github.io)  
-> 欢迎就工作流引擎架构、拓扑调度和低门槛开发体验交流指教。
+## Human-AI Collaboration & Design Philosophy
+
+This project was built by **Guo Qiang** through an active **AI Pair Programming** and **"Learning by Doing"** workflow:
+- **Human-driven inputs**: Rooted in real production pain points—GPU cold-start hangs, local out-of-memory cascading failures, and sensitive data leakage over streaming LLM connections.
+- **AI-driven inputs**: Focused on foundational systems constraints—sliding-window streaming state machines, cross-packet SSE placeholder stitch buffers, silent pre-header HTTP fallback, and lock-free single-worker WAL batching.
+
+Constructive reviews and architectural discussions on deterministic AI workflows, DAG engines, and edge systems are warmly welcomed!
+
+---
+
+> **About the Author**  
+> **Guo Qiang (GuoBug)**, Product Engineer specializing in platform engineering and growth. Currently focused on AI workflow orchestration, DAG state machines, and deterministic system architectures.  
+> Open Source & Homepage: [https://github.com/GuoBug](https://github.com/GuoBug) · [https://guobug.github.io](https://guobug.github.io)  
+> Inquiries and discussions on workflow engine architecture, topological scheduling, and developer experience are warmly welcomed.
