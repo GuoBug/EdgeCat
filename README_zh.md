@@ -216,16 +216,6 @@ EdgeCat 秉持 **“网关是本体，中枢是用法”** 的极简工程哲学
 
 ---
 
-## 人机协同与演进理念 (Collaboration Note)
-
-本项目由作者 **Guo Qiang** 借助 AI Pair Programming（人机结对共创）通过“干中学（Learning by Doing）”模式探索落地：
-- **人提的关键点**：来源于真实生产场景中本地大模型“首字卡死无限等待”、“单机 GPU 显存过载崩溃”以及“私有数据流式送模泄露”等系统痛点；
-- **AI 提的关键点**：聚焦于“滑动窗口双游标状态机”、“SSE 跨分包占位符拆分防丢”、“HTTP 流式劫持与未刷 Header 前静默降级”及“WAL 模式下 SQLite 单协程批量写入无锁优化”。
-
-欢迎对 AI 边缘网关、确定性工作流以及系统工程感兴趣的同行与架构师交流指教！
-
----
-
 > **关于作者**  
 > **郭强 (GuoBug)**，Product Engineer，做平台工程也做业务增长。目前主要在折腾 AI 工作流编排、DAG 状态机与确定性系统架构。  
 > 开源项目与主页：[https://github.com/GuoBug](https://github.com/GuoBug) · [https://guobug.github.io](https://guobug.github.io)  

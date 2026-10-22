@@ -218,16 +218,6 @@ Guided by the principle that **"the gateway is the core, while a 'Personal AI Hu
 
 ---
 
-## Human-AI Collaboration & Design Philosophy
-
-This project was built by **Guo Qiang** through an active **AI Pair Programming** and **"Learning by Doing"** workflow:
-- **Human-driven inputs**: Rooted in real production pain points—GPU cold-start hangs, local out-of-memory cascading failures, and sensitive data leakage over streaming LLM connections.
-- **AI-driven inputs**: Focused on foundational systems constraints—sliding-window streaming state machines, cross-packet SSE placeholder stitch buffers, silent pre-header HTTP fallback, and lock-free single-worker WAL batching.
-
-Constructive reviews and architectural discussions on deterministic AI workflows, DAG engines, and edge systems are warmly welcomed!
-
----
-
 > **About the Author**  
 > **Guo Qiang (GuoBug)**, Product Engineer specializing in platform engineering and growth. Currently focused on AI workflow orchestration, DAG state machines, and deterministic system architectures.  
 > Open Source & Homepage: [https://github.com/GuoBug](https://github.com/GuoBug) · [https://guobug.github.io](https://guobug.github.io)  
