@@ -155,12 +155,49 @@ audit:
 
 ---
 
-## 接口说明
+## 协议选择与生态设计：为什么是 OpenAI 兼容协议？ (Why OpenAI-Compatible API?)
 
-EdgeCat 100% 兼容 OpenAI ChatCompletion 协议：
-- **`POST /v1/chat/completions`**：支持标准 JSON 及 SSE 流式（`stream: true`）传输。
+在接口架构设计之初，一个核心问题是：**网关应该发明专有协议，还是拥抱既有标准？**
+
+EdgeCat 坚决选择了完全对齐 **OpenAI API 兼容协议（OpenAI-Compatible Wire Protocol）**。
+
+### 1. 核心概念辨析：OpenAI 兼容协议 vs. OpenAPI (Swagger)
+许多开发者容易混淆这两个名称：
+- **OpenAI 兼容协议 (OpenAI-Compatible API)**：由 OpenAI 公司制定并演化为全球大模型事实标准的**线缆级通信协议**（包含 `POST /v1/chat/completions`、`{"model": "...", "messages": [{"role": "user", "content": "..."}]}` 与 Server-Sent Events 流式规范）。它相当于 AI 通信领域的 **Type-C 工业标准**。
+- **OpenAPI 规范 (OpenAPI Specification，前身 Swagger)**：一种用于编写和描述通用 RESTful HTTP 接口文档的 **元数据格式（YAML/JSON）**。它并不规定具体的 AI 交互语义。
+
+### 2. 为什么 EdgeCat 必须采用 OpenAI 兼容协议？
+1. **零改造、即插即用 (Zero-Code Drop-in Replacement)**：  
+   现有的任何企业级 AI 应用、Agent 框架（LangChain、LlamaIndex、Dify、AutoGen）、开源客户端（Chatbox、Cherry Studio、NextChat、沉浸式翻译）以及官方 SDK（Python / Node.js `openai` 库），**无需修改任何业务代码**，仅需将 `Base URL` 指向 `http://localhost:8080/v1`，即可瞬间获得 EdgeCat 的隐私脱敏、本地/云端动态容灾与异步审计治理能力。
+2. **连接本地与云端的通用桥梁 (Universal Interoperability)**：  
+   无论是本地推理引擎（Ollama、vLLM、llama.cpp、LocalAI），还是云端主流模型服务商（DeepSeek、阿里云百炼/通义千问、月之暗面 Kimi、智谱 GLM、OpenAI），均统一支持该协议。EdgeCat 作为中介层，能够无缝抹平本地与云端物理差异。
+
+### 3. 支持接口与生态接入方式
+
+EdgeCat 对外暴露以下标准化治理端点：
+- **`POST /v1/chat/completions`**：支持标准非流式 JSON 及实时 SSE 流式（`stream: true`）传输。
 - **`GET /health`**：实时返回本地/云端端点状态、本地活动信号量并发数、累计降级次数以及异步审计日志吞吐指标。
 - **`GET /v1/models`**：提供 OpenAI 兼容的模型列表发现。
+
+#### 客户端配置示例：
+- **Chatbox / Cherry Studio / NextChat**：
+  - API 格式：选择 `OpenAI API`
+  - API 地址 (Base URL)：`http://localhost:8080/v1`
+  - API Key：任意填写（如 `none`）
+- **Python (官方 `openai` SDK)**：
+  ```python
+  from openai import OpenAI
+
+  client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
+  response = client.chat.completions.create(
+      model="gpt-4o-mini",
+      messages=[{"role": "user", "content": "我的电话是 13800138000"}],
+      stream=True,
+  )
+  for chunk in response:
+      if chunk.choices[0].delta.content:
+          print(chunk.choices[0].delta.content, end="", flush=True)
+  ```
 
 ---
 
