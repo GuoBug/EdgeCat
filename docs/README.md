@@ -19,5 +19,6 @@ docs/
 
 ## Guidelines for Future Agents & Contributors
 
-1. **Architecture Decisions**: When proposing structural changes (e.g., protocol rewrites, new storage engines, circuit-breaker algorithms), create a new ADR under `docs/adr/` numbered sequentially (`0002-...md`).
-2. **README Discipline**: Keep `README.md` lean, punchy, and focused on quickstart and user onboarding. In-depth engineering rationale and trade-offs belong in `docs/adr/` or `docs/architecture/`.
+1. **Architecture Decisions**: When proposing structural changes (e.g., protocol rewrites, new storage engines, circuit-breaker algorithms), create a new ADR under `docs/adr/` numbered sequentially (`0003-...md`).
+2. **README Discipline**: Keep `README.md` lean, punchy, and focused on quickstart and user onboarding. In-depth engineering rationale and trade-offs belong in `docs/adr/`.
+3. **No Speculative Present Tense**: ADRs may state a decision, but anything not yet implemented must be marked with its roadmap ID and an explicit status note. A reader must never be able to mistake a planned safeguard for a shipped one.

@@ -48,6 +48,18 @@ This document tracks **EdgeCat**'s product positioning, completed architectural 
 | **R2.4** | **Controlled CORS & Chrome PNA Preflight** | 1. Configure `server.allowed_origins` allowlist (e.g., `https://patchcat.dev`, `http://localhost:5173`).<br>2. Handle `OPTIONS` preflight requests (`204 No Content`).<br>3. Support Chrome Private Network Access: respond with `Access-Control-Allow-Private-Network: true` when `Access-Control-Request-Private-Network: true` is present, allowing HTTPS web apps to reach LAN/localhost EdgeCat instances safely. | **P1** |
 | **R2.5** | **Per-Client SQLite Audit Attribution** | 1. Add `client_name TEXT NOT NULL DEFAULT 'anonymous'` to `audit_logs` (with idempotent startup schema migration for existing DBs).<br>2. Expose per-client daily local/cloud counters and remaining cloud quota in `GET /health`. | **P1** |
 
+#### Design Constraints to Resolve Before Phase 2
+
+> The following 5 items were raised by a **DeepSeek cross-review** (2026-10-22). They are not yet folded into the acceptance criteria above; each needs a decision before implementation starts, or the work will be re-done.
+
+| # | Open Question | Recommended Resolution | Affects |
+| :--- | :--- | :--- | :--- |
+| **D1** | **Quota check timing**: for streaming requests the fallback happens after `tryLocalStream` fails but before SSE headers are written. If quota is evaluated after the headers, a `429` can no longer be delivered | Insert the quota check between "local failed" and "call cloud", strictly before `WriteHeader` — that is the only rejection window | R2.3 |
+| **D2** | **Quota counter durability**: an in-memory atomic counter resets to zero on restart, and NAS boxes reboot — so the daily quota can be bypassed by restarting the process | Persist daily counters in SQLite (one row per client per day) and load on startup; keep memory only as a hot-path cache | R2.3 / R2.5 |
+| **D3** | **Failure semantics of `daily_cloud_limit: -1`**: what to return when the local tier is unavailable and the client is forbidden from using cloud | Return `503 Service Unavailable` with an explicit message (local unavailable and cloud fallback disabled for this client), not a generic `429` | R2.3 |
+| **D4** | **Quota day boundary timezone**: reset at UTC midnight or server-local midnight | Use server-local time (what homelab users expect) and expose the next reset timestamp in `/health` | R2.3 |
+| **D5** | **`/v1/models` is still hardcoded**: it returns three fixed model names, so multi-device clients (Cherry Studio et al.) cannot discover the logical models configured on this gateway, while physical model names leak | Derive the logical model list from the keys of `local.model_mapping` / `cloud.model_mapping`; never expose physical names via discovery | Prerequisite for R2.4 (client usability) |
+
 ---
 
 ### 🔭 Phase 3: Extensibility Hooks & Production Telemetry (Future Backlog)

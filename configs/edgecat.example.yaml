@@ -1,5 +1,11 @@
-﻿# EdgeCat - Local-First AI Inference Governance Gateway
+# EdgeCat - Local-First AI Inference Governance Gateway
 # Copyright (c) 2026 Guo Qiang. Distributed under Apache-2.0.
+#
+# SECURITY NOTICE
+# The default host below binds every interface, and EdgeCat currently has no
+# inbound authentication (sub-token auth is planned for Phase 2 / R2.1-R2.2).
+# Run it on a trusted LAN only. Never expose this port to the public internet
+# without a TLS-terminating reverse proxy and an authentication layer in front.
 
 server:
   host: "0.0.0.0"

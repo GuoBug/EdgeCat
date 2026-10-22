@@ -45,6 +45,7 @@ Hosting the master Cloud API Key inside EdgeCat's local configuration eliminates
 1. **Revocable Per-Device Sub-Tokens**: Each device/client receives an independent token (`ec-workstation`, `ec-ipad`, `ec-patchcat`) that can be revoked independently without rotating upstream cloud keys.
 2. **Unlimited Free Local Tier, Capped Paid Cloud Tier (`daily_cloud_limit`)**: Local Ollama inference consumes zero quota; fallback calls to paid Cloud Tiers are bounded by per-token daily quotas so runaway agent loops or compromised client tokens cannot drain cloud billing.
 3. **Fail-Closed Non-Loopback Guard**: Default bind is `127.0.0.1`. Binding to `0.0.0.0` or a LAN IP requires explicit token authentication and an origin allowlist (supporting Chrome Private Network Access `Access-Control-Allow-Private-Network: true`).
+   > ⚠️ **Implementation status**: This is an accepted decision direction tracked as R2.1 (P0, Phase 2). **The current default is still `0.0.0.0` and inbound authentication is not wired up yet**, so only run it on a trusted LAN for now and never expose it directly to the public internet.
 
 ---
 
@@ -56,7 +57,7 @@ Hosting the master Cloud API Key inside EdgeCat's local configuration eliminates
 2. **Realistic Threat Model (Offline Replica Protection)**:
    - On a personal workstation or home NAS, an attacker with local root/process memory access can already dump RAM or read OS keyrings. Encryption only mitigates **offline file leakage** (cloud drive sync, backup disks, hardware repair).
 3. **Storage Discipline**:
-   - **Default Baseline (Active)**: The PII `Vault` remains **100% in-memory and request-scoped**. `audit_logs` records only metadata (`request_id`, `client_name`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—**never raw conversation payloads or plaintext PII**.
+   - **Default Baseline (Active)**: The PII `Vault` remains **100% in-memory and request-scoped**. `audit_logs` records only metadata (`request_id`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—**never raw conversation payloads or plaintext PII**. (The per-client `client_name` column is planned as R2.5 and does not exist in the current schema.)
    - **Future Memory Plugin Contract (Phase 3)**: Any opt-in memory plugin must store only distilled non-PII facts (`Facts`), enforce short TTLs on raw context, and replace per-request sequential counters with `HMAC-SHA256(plaintext, local_secret)` stable keys.
 
 ---
@@ -64,7 +65,7 @@ Hosting the master Cloud API Key inside EdgeCat's local configuration eliminates
 ## 5. Consequences
 
 ### Positive:
-- **Focused Scope**: A `< 20MB` zero-dependency static binary that solves real homelab/small-team governance problems without UI or multi-tenant bloat.
+- **Focused Scope**: A ~12MB (`linux/amd64`, `-s -w` static build) zero-dependency static binary that solves real homelab/small-team governance problems without UI or multi-tenant bloat.
 - **Lossless & Long-Stream Safe**: `internal/proxy/protocol.go` preserves all upstream/downstream extension fields (`tools`, `tool_calls`, `reasoning_content`, multimodal arrays) and replaces fixed write deadlines with rolling SSE idle deadlines (`stream_idle_timeout_ms`).
 
 ### Trade-offs & Boundaries:

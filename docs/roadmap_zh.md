@@ -48,6 +48,18 @@
 | **R2.4** | **受控 CORS 与 Chrome PNA 局域网预检** | 1. 配置项 `server.allowed_origins`（支持精确域名白名单，如 `https://patchcat.dev`、`http://localhost:5173`，严禁在启用鉴权时无脑反射任意 `*`）。<br>2. 完整处理 `OPTIONS` 预检请求（返回 `204 No Content`）。<br>3. 支持 Chrome Private Network Access 规范：当收到 `Access-Control-Request-Private-Network: true` 时，响应头注入 `Access-Control-Allow-Private-Network: true`，确保公网 HTTPS 部署的 PatchCat 前端可安全访问用户本机或局域网 NAS 上的 EdgeCat。 | **P1** |
 | **R2.5** | **按设备/成员维度的 SQLite 分账审计** | 1. `audit_logs` 表新增 `client_name TEXT NOT NULL DEFAULT 'anonymous'` 列（支持已有数据库启动时自动 `ALTER TABLE` 幂等迁移）。<br>2. 在 `/health` 端点中增加 `clients_usage` 汇总视图，实时展示各设备的今日请求数與剩余云端降级配额。 | **P1** |
 
+#### Phase 2 实施前待定的设计约束 (Design Constraints to Resolve First)
+
+> 以下 5 条由 **DeepSeek 交叉审阅**（2026-10-22）提出，尚未并入上表验收标准。开工前需先逐条定论，否则会在实现阶段返工。
+
+| # | 待定问题 | 建议结论 | 影响需求 |
+| :--- | :--- | :--- | :--- |
+| **D1** | **配额判定时机**：流式请求的降级发生在 `tryLocalStream` 失败之后、SSE Header 写出之前。若配额在 Header 之后才判定，`429` 已经无法回传 | 配额检查必须插在「本地失败 → 调用云端」之间且早于 `WriteHeader`，这是唯一的拒绝窗口 | R2.3 |
+| **D2** | **配额计数持久化**：纯内存原子计数在进程重启后归零，而 NAS 会重启，等于当日配额可被重启绕过 | 每日计数落 SQLite（每客户端每日一行），启动时加载；内存仅作热路径缓存 | R2.3 / R2.5 |
+| **D3** | **`daily_cloud_limit: -1` 的失败语义**：本地不可用且该客户端被禁止走云端时，应返回什么 | 返回 `503 Service Unavailable` 并给出明确文案（本地不可用且该客户端禁止云端降级），而非笼统的 `429` | R2.3 |
+| **D4** | **配额自然日时区**：按 UTC 还是服务端本地时区重置 | 采用服务端本地时区（家庭场景用户预期为本地日），并在 `/health` 暴露下次重置时间点 | R2.3 |
+| **D5** | **`/v1/models` 仍为硬编码**：当前固定返回三个模型名，多设备共享时客户端（Cherry Studio 等）无法发现配置中的逻辑模型，物理模型名反而被暴露 | 改为从 `local.model_mapping` / `cloud.model_mapping` 的键派生逻辑模型列表，物理名不出现在发现接口 | R2.4 前置（客户端可用性） |
+
 ---
 
 ### 🔭 Phase 3：可插拔扩展契约与长期验证（远期储备）

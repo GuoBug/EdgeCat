@@ -187,12 +187,14 @@ EdgeCat is wire-compatible with the **OpenAI ChatCompletion Protocol** for chat 
 Guided by the principle that **"the gateway is the core, while a 'Personal AI Hub' is a usage pattern"**, EdgeCat focuses strictly on horizontal streaming governance across two primary topologies (**do not expose directly to the public internet without TLS and authentication**):
 
 1. **Localhost Developer Sidecar**  
-   Binds to `127.0.0.1:8080` as the local runtime companion for **PatchCat** (visual DAG workflow orchestrator), IDE coding assistants, and CLI agents. Workflows are shared via stateless PatchCat DAG JSON definitions rather than exposing live server endpoints.
+   Runs on `127.0.0.1:8080` as the local runtime companion for **PatchCat** (visual DAG workflow orchestrator), IDE coding assistants, and CLI agents. Workflows are shared via stateless PatchCat DAG JSON definitions rather than exposing live server endpoints.
 2. **Homelab / Small-Team LAN Gateway (NAS / Home Server)**  
-   Runs as a `< 20MB` static binary on a home NAS, Mac mini, or router to serve 2–3 people across multiple devices on a trusted local network:
-   - **Centralized Cloud Key Vaulting**: Master Cloud API Keys remain on the NAS; client devices use revocable per-device sub-tokens (Phase 2);
-   - **Unlimited Free Local Compute, Capped Paid Cloud Fallback**: Local Ollama traffic runs uncapped, while paid cloud fallback calls are bounded by per-device daily quotas and SQLite attribution to prevent runaway agent loops or browser XSS from draining cloud billing;
-   - **Zero-Disk PII Threat Model**: The PII `Vault` is 100% ephemeral and request-scoped in RAM. `audit_logs` stores only operational telemetry (`request_id`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—never raw prompts or plaintext PII, eliminating offline database replica leakage risks.
+   Runs as a ~12MB static binary on a home NAS, Mac mini, or router to serve 2–3 people across multiple devices on a trusted local network:
+   - **Centralized Cloud Key Vaulting** (Phase 2): Master Cloud API Keys remain on the NAS; client devices will use revocable per-device sub-tokens;
+   - **Unlimited Free Local Compute, Capped Paid Cloud Fallback** (Phase 2): Local Ollama traffic runs uncapped, while paid cloud fallback calls will be bounded by per-device daily quotas and SQLite attribution to prevent runaway agent loops or browser XSS from draining cloud billing;
+   - **Zero-Disk PII Threat Model** (active today): The PII `Vault` is 100% ephemeral and request-scoped in RAM. `audit_logs` stores only operational telemetry (`request_id`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—never raw prompts or plaintext PII, eliminating offline database replica leakage risks.
+
+> ⚠️ **This version has no inbound authentication yet**: it binds `0.0.0.0` by default and must only be used on a trusted LAN. Sub-token auth and the Fail-Closed guard are tracked in [Roadmap Phase 2](docs/roadmap.md).
 
 ### Zero-Invasiveness Client Setup:
 - **Desktop & Web Clients (Chatbox / Cherry Studio / NextChat)**:
