@@ -1,4 +1,4 @@
-﻿// EdgeCat - Local-First AI Inference Governance Gateway
+// EdgeCat - Local-First AI Inference Governance Gateway
 //
 // Copyright (c) 2026 Guo Qiang.
 // Distributed under the terms of the Apache License 2.0.

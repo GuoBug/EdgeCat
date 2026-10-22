@@ -5,12 +5,12 @@
   <a href="README_zh.md">中文</a>
 </p>
 
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![CGO_ENABLED](https://img.shields.io/badge/CGO_ENABLED-0-success?style=flat)]()
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Local--First_Dual--Track-orange)]()
 
-> **EdgeCat** is an ultra-lightweight, deterministic, local-first AI inference governance gateway written in Go 1.22+ and compiled with `CGO_ENABLED=0` pure static binaries.  
+> **EdgeCat** is an ultra-lightweight, deterministic, local-first AI inference governance gateway written in Go 1.26+ and compiled with `CGO_ENABLED=0` pure static binaries.  
 > Purpose-built to solve real-world engineering bottlenecks when bridging local edge inference engines (Ollama, vLLM, llama.cpp) with cloud fallback tiers (OpenAI, DeepSeek, Qwen).
 
 ---
@@ -23,7 +23,7 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 3. **Contract Drift & Code Fence Violations**: Local LLMs often ignore `response_format` and wrap outputs in unwanted ````json markdown code blocks, breaking downstream strict serialization contracts.
 4. **Synchronous Audit Latency Penalties**: Traditional gateways write audit logs directly within the HTTP request goroutine, causing severe Time-To-First-Token (TTFT) degradation.
 
-**EdgeCat eliminates these failure modes through five deterministic mechanisms:**
+**EdgeCat eliminates these failure modes through six deterministic mechanisms:**
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -81,12 +81,18 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 - EdgeCat dynamically rewrites the request model: mapping to the configured local model (`qwen2.5:7b`) on the local tier, or the cloud model on fallback, with automatic recalculation of HTTP `Content-Length`.
 
 ### 4. Strict JSON Contract Guard & Bounded Repair Loop
-- When `response_format: {"type": "json_object"}` or header `X-EdgeCat-Strict-JSON: true` is present, the gateway automatically strips markdown fences (````json ... ````) and cleans trailing whitespace.
+- `contract.strict_json_enabled` is the master switch. Once enabled, when `response_format: {"type": "json_object"}` or header `X-EdgeCat-Strict-JSON: true` is present, the gateway strips markdown fences (````json ... ````) and cleans trailing whitespace.
 - If syntax validation fails, EdgeCat initiates at most **one bounded repair call** under strict timeout to prompt the model for valid JSON, preventing runaway recursion.
+- **Scope is limited to non-streaming, whole-body responses.** Contract repair requires buffering the complete response and issuing a second call, which directly contradicts the first-token latency goal of SSE — streaming responses are therefore never contract-repaired.
 
 ### 5. Lock-Free Asynchronous SQLite Batch Audit
 - Powered by `modernc.org/sqlite` (pure Go, zero CGO). Uses `_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)` for high-throughput single-writer performance.
 - HTTP handlers push audit entries (`RequestID`, `RouteTarget`, `Model`, `LatencyMs`, `TTFTMs`, `PIIRedactedCount`, `Status`) into a bounded channel (capacity 10,000) using a non-blocking `select-default` pattern. A dedicated background worker flushes batches by threshold (50 items) or ticker interval.
+
+### 6. Lossless Wire Passthrough
+- Neither direction is ever rebuilt from a typed struct: the gateway rewrites only the fields it actually owns (`model` aliasing, redacted text) and forwards everything else verbatim (`tools`, `tool_choice`, `top_p`, `presence_penalty`, `seed`, vendor extensions). On the egress side placeholders are restored directly on the raw bytes instead of decode-into-struct-then-re-encode.
+- As a result `tools` / `tool_calls` / `reasoning_content` (DeepSeek-style reasoning models) / `logprobs` / multimodal `content` arrays all pass through intact, so tool-calling and vision clients need no adaptation.
+- Numbers are carried as `json.Number`, so integer literals such as `created` are never reformatted into scientific notation by a float64 round trip. Multimodal `content` arrays are masked part-by-part: only `text` blocks are redacted, image/audio payloads are forwarded untouched.
 
 ---
 
@@ -115,6 +121,10 @@ Review `configs/edgecat.example.yaml`:
 server:
   host: "0.0.0.0"
   port: 8080
+  write_timeout_ms: 120000
+  # SSE only: streams are bounded by idle time, not total duration, so slow
+  # local models can keep producing tokens for as long as they need.
+  stream_idle_timeout_ms: 300000
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"
@@ -158,12 +168,31 @@ Start the gateway:
 
 ## Endpoints & Ecosystem Integration
 
-EdgeCat is 100% wire-compatible with the **OpenAI ChatCompletion Protocol** for zero-code drop-in proxying:
+EdgeCat is wire-compatible with the **OpenAI ChatCompletion Protocol** for chat and tool-calling semantics, allowing zero-code drop-in proxying:
 - **`POST /v1/chat/completions`**: Supports standard JSON responses and low-latency SSE streaming (`stream: true`).
+- **Protocol coverage**: `tools` / `tool_choice` / `tool_calls` / `reasoning_content` / multimodal `content` arrays / `temperature` / `top_p` / `max_tokens` / `seed` are all forwarded losslessly.
+- **Not implemented**: `/v1/embeddings`, `/v1/completions`, `/v1/responses` (these return 404).
 - **`GET /health`**: Returns real-time health metrics, active concurrency slots, fallback statistics, and audit pipeline throughput.
 - **`GET /v1/models`**: Provides OpenAI-compatible model catalog discovery.
 
-> 💡 **Architectural Decision Record**: For detailed trade-offs, rationale on avoiding custom REST, and disambiguation from OpenAPI (Swagger), see [ADR-0001: Adoption of OpenAI-Compatible Wire Protocol](docs/adr/0001-openai-wire-protocol.md).
+> 💡 **Architecture Decision Records & Roadmap**:
+> - [ADR-0001: Adoption of OpenAI-Compatible Wire Protocol](docs/adr/0001-openai-wire-protocol.md) (Wire Protocol vs. OpenAPI/Swagger disambiguation)
+> - [ADR-0002: Product Positioning, Homelab LAN Sharing & Threat Model](docs/adr/0002-positioning-and-homelab-governance.md) ("Gateway as Core, Hub as Usage", NAS LAN sharing boundaries, and zero-disk PII threat model)
+> - [EdgeCat Requirements Backlog & Evolution Roadmap](docs/roadmap.md) (Completed Phase 1.5 core & Phase 2 LAN sub-token/cloud-fallback quota specifications)
+
+---
+
+## Deployment Topologies & Security Model
+
+Guided by the principle that **"the gateway is the core, while a 'Personal AI Hub' is a usage pattern"**, EdgeCat focuses strictly on horizontal streaming governance across two primary topologies (**do not expose directly to the public internet without TLS and authentication**):
+
+1. **Localhost Developer Sidecar**  
+   Binds to `127.0.0.1:8080` as the local runtime companion for **PatchCat** (visual DAG workflow orchestrator), IDE coding assistants, and CLI agents. Workflows are shared via stateless PatchCat DAG JSON definitions rather than exposing live server endpoints.
+2. **Homelab / Small-Team LAN Gateway (NAS / Home Server)**  
+   Runs as a `< 20MB` static binary on a home NAS, Mac mini, or router to serve 2–3 people across multiple devices on a trusted local network:
+   - **Centralized Cloud Key Vaulting**: Master Cloud API Keys remain on the NAS; client devices use revocable per-device sub-tokens (Phase 2);
+   - **Unlimited Free Local Compute, Capped Paid Cloud Fallback**: Local Ollama traffic runs uncapped, while paid cloud fallback calls are bounded by per-device daily quotas and SQLite attribution to prevent runaway agent loops or browser XSS from draining cloud billing;
+   - **Zero-Disk PII Threat Model**: The PII `Vault` is 100% ephemeral and request-scoped in RAM. `audit_logs` stores only operational telemetry (`request_id`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—never raw prompts or plaintext PII, eliminating offline database replica leakage risks.
 
 ### Zero-Invasiveness Client Setup:
 - **Desktop & Web Clients (Chatbox / Cherry Studio / NextChat)**:

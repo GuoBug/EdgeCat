@@ -6,11 +6,15 @@ Welcome to the internal engineering documentation of EdgeCat. This repository fo
 
 ```
 docs/
-├── README.md                          # Documentation index (this file)
-└── adr/                               # Architecture Decision Records (ADR)
-    ├── README.md                      # ADR registry and lifecycle index
-    ├── 0001-openai-wire-protocol.md    # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (EN)
-    └── 0001-openai-wire-protocol_zh.md # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (ZH)
+├── README.md                                          # Documentation index (this file)
+├── roadmap.md                                         # Product positioning & phased requirements backlog (EN)
+├── roadmap_zh.md                                      # 项目需求池与演进路线图 (ZH)
+└── adr/                                               # Architecture Decision Records (ADR)
+    ├── README.md                                      # ADR registry and lifecycle index
+    ├── 0001-openai-wire-protocol.md                   # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (EN)
+    ├── 0001-openai-wire-protocol_zh.md                # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (ZH)
+    ├── 0002-positioning-and-homelab-governance.md     # ADR-0002: Homelab LAN Sharing, Positioning & Threat Model (EN)
+    └── 0002-positioning-and-homelab-governance_zh.md  # ADR-0002: 治理网关定位、家庭/内网共享与安全威胁模型 (ZH)
 ```
 
 ## Guidelines for Future Agents & Contributors

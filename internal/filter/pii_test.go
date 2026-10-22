@@ -1,4 +1,4 @@
-﻿// Package filter_test tests PII masking, Vault consistency, and sliding-window
+// Package filter_test tests PII masking, Vault consistency, and sliding-window
 // stream rehydration for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.

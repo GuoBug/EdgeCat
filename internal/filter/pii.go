@@ -1,4 +1,4 @@
-﻿// Package filter implements PII masking, deterministic vaulting, and
+// Package filter implements PII masking, deterministic vaulting, and
 // sliding-window SSE rehydration for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.

@@ -1,4 +1,4 @@
-﻿// Package contract handles output contract sanitization, JSON validation,
+// Package contract handles output contract sanitization, JSON validation,
 // and bounded repair loops for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.

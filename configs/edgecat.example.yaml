@@ -6,6 +6,9 @@ server:
   port: 8080
   read_timeout_ms: 30000
   write_timeout_ms: 120000
+  # SSE only: streams are bounded by idle time rather than total duration, so a
+  # slow local model can keep streaming past write_timeout_ms.
+  stream_idle_timeout_ms: 300000
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"

@@ -1,4 +1,4 @@
-﻿// Package contract_test tests JSON fence stripping, syntax validation,
+// Package contract_test tests JSON fence stripping, syntax validation,
 // and single-shot repair loops.
 //
 // Copyright (c) 2026 Guo Qiang.

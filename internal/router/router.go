@@ -1,4 +1,4 @@
-﻿// Package router manages tier routing, local concurrency semaphores,
+// Package router manages tier routing, local concurrency semaphores,
 // TTFT-driven circuit breaking, and model alias rewriting for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.

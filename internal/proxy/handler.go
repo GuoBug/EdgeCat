@@ -1,4 +1,4 @@
-﻿// Package proxy implements OpenAI-compatible HTTP and SSE governance handlers for EdgeCat.
+// Package proxy implements OpenAI-compatible HTTP and SSE governance handlers for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.
 // Distributed under the terms of the Apache License 2.0.
@@ -26,45 +26,9 @@ import (
 	"github.com/patchcat-dev/edgecat/internal/router"
 )
 
-// OpenAI-compatible ChatCompletion schema.
-type ChatCompletionRequest struct {
-	Model          string          `json:"model"`
-	Messages       []ChatMessage   `json:"messages"`
-	Stream         bool            `json:"stream,omitempty"`
-	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
-	Temperature    *float64        `json:"temperature,omitempty"`
-	MaxTokens      *int            `json:"max_tokens,omitempty"`
-}
-
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type ResponseFormat struct {
-	Type string `json:"type"`
-}
-
-type ChatCompletionResponse struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model"`
-	Choices []ChatChoice `json:"choices"`
-	Usage   *ChatUsage   `json:"usage,omitempty"`
-}
-
-type ChatChoice struct {
-	Index        int         `json:"index"`
-	Message      ChatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"`
-}
-
-type ChatUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
+// defaultStreamIdleTimeoutMs bounds how long an SSE stream may stay silent
+// before the connection write deadline expires.
+const defaultStreamIdleTimeoutMs = 300000
 
 // Handler orchestrates request lifecycle, filtering, routing, and auditing.
 type Handler struct {
@@ -161,8 +125,8 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 	_ = r.Body.Close()
 
-	var chatReq ChatCompletionRequest
-	if err := json.Unmarshal(bodyBytes, &chatReq); err != nil {
+	req, err := ParseRequest(bodyBytes)
+	if err != nil {
 		http.Error(w, `{"error": "malformed JSON request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -170,14 +134,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	// 1. PII Masking and Request Vault
 	vault := filter.NewVault()
 	if h.cfg.Filter.Enabled && h.masker != nil {
-		for i := range chatReq.Messages {
-			chatReq.Messages[i].Content = h.masker.MaskText(chatReq.Messages[i].Content, vault)
-		}
+		MaskRequestContent(req, h.masker, vault)
 	}
 	piiRedacted := vault.RedactedCount()
 
 	// 2. Routing and concurrency admission
-	decision := h.router.DecideRoute(chatReq.Model)
+	decision := h.router.DecideRoute(req.Model())
 	defer func() {
 		if decision.AcquiredLocal {
 			h.router.ReleaseLocal()
@@ -185,26 +147,34 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 	}()
 
-	// Check if strict JSON is requested
-	strictJSON := false
-	if strings.EqualFold(r.Header.Get("X-EdgeCat-Strict-JSON"), "true") {
-		strictJSON = true
-	} else if chatReq.ResponseFormat != nil && chatReq.ResponseFormat.Type == "json_object" {
-		strictJSON = true
-	}
+	// 3. Strict JSON contract opt-in.
+	// contract.strict_json_enabled is the master switch; the client may then ask
+	// for enforcement per call. Contract repair requires buffering the entire
+	// response, so it deliberately does not apply to SSE streams (documented in
+	// README: streaming keeps its first-token latency instead).
+	strictJSON := h.guard.StrictJSONEnabled && clientWantsStrictJSON(r, req)
 
-	if chatReq.Stream {
-		h.handleStreaming(w, r, requestID, &chatReq, decision, vault, startTime, piiRedacted)
+	if req.Stream() {
+		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted)
 	} else {
-		h.handleNonStreaming(w, r, requestID, &chatReq, decision, vault, startTime, piiRedacted, strictJSON)
+		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON)
 	}
+}
+
+// clientWantsStrictJSON reports whether this specific call opted into contract
+// enforcement, via header or response_format.
+func clientWantsStrictJSON(r *http.Request, req *Request) bool {
+	if strings.EqualFold(r.Header.Get("X-EdgeCat-Strict-JSON"), "true") {
+		return true
+	}
+	return req.ResponseFormatType() == "json_object"
 }
 
 func (h *Handler) handleStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
 	reqID string,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	decision router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
@@ -216,6 +186,12 @@ func (h *Handler) handleStreaming(
 		return
 	}
 
+	// SSE responses routinely outlive the server-wide WriteTimeout: a slow local
+	// model can legitimately stream for minutes. Disabling the deadline outright
+	// would let a dead peer pin a goroutine forever, so instead we install a
+	// rolling idle deadline that is refreshed on every successful flush.
+	touchDeadline := newStreamDeadlineRefresher(w, h.cfg.Server.StreamIdleTimeoutMs)
+
 	var upstreamResp *http.Response
 	var finalTarget = decision.Target
 	var finalModel = decision.TargetModel
@@ -224,8 +200,11 @@ func (h *Handler) handleStreaming(
 
 	// If Local was acquired, attempt local streaming with strict TTFT timeout watcher
 	if decision.AcquiredLocal {
-		resp, chunk, capturedTTFT, err := h.tryLocalStream(r.Context(), chatReq, decision.TargetModel)
+		resp, chunk, capturedTTFT, cancelLocal, err := h.tryLocalStream(r.Context(), req, decision.TargetModel)
 		if err == nil {
+			// The local stream must stay alive until the body is fully relayed,
+			// so cancellation is deferred to the end of this handler.
+			defer cancelLocal()
 			upstreamResp = resp
 			firstChunk = chunk
 			ttftMs = capturedTTFT
@@ -237,13 +216,13 @@ func (h *Handler) handleStreaming(
 			h.router.RecordFallback()
 
 			finalTarget = router.TargetCloud
-			finalModel = h.router.ResolveModel(router.TargetCloud, chatReq.Model)
+			finalModel = h.router.ResolveModel(router.TargetCloud, req.Model())
 		}
 	}
 
 	// If not routed to local or local timed out, route to Cloud
 	if upstreamResp == nil {
-		cloudResp, err := h.callCloudStream(r.Context(), chatReq, finalModel)
+		cloudResp, err := h.callCloudStream(r.Context(), req, finalModel)
 		if err != nil {
 			log.Printf("[Proxy %s] Cloud fallback error: %v", reqID, err)
 			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
@@ -264,6 +243,7 @@ func (h *Handler) handleStreaming(
 	defer upstreamResp.Body.Close()
 
 	// Write SSE Response Headers
+	touchDeadline()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -277,6 +257,7 @@ func (h *Handler) handleStreaming(
 	if len(firstChunk) > 0 {
 		out := rehydrator.Feed(string(firstChunk))
 		if len(out) > 0 {
+			touchDeadline()
 			_, _ = w.Write([]byte(out))
 			flusher.Flush()
 		}
@@ -292,6 +273,7 @@ func (h *Handler) handleStreaming(
 			}
 			out := rehydrator.Feed(string(buf[:n]))
 			if len(out) > 0 {
+				touchDeadline()
 				_, _ = w.Write([]byte(out))
 				flusher.Flush()
 			}
@@ -306,6 +288,7 @@ func (h *Handler) handleStreaming(
 
 	// Flush any pending tail in rehydrator buffer
 	if tail := rehydrator.Flush(); len(tail) > 0 {
+		touchDeadline()
 		_, _ = w.Write([]byte(tail))
 		flusher.Flush()
 	}
@@ -323,18 +306,42 @@ func (h *Handler) handleStreaming(
 	})
 }
 
+// newStreamDeadlineRefresher returns a function that pushes the connection write
+// deadline forward. Callers invoke it before every write/flush so that a
+// long-lived stream is bounded by idleness rather than by total duration.
+//
+// http.ResponseController reports ErrNotSupported for recorders and custom
+// ResponseWriters; the error is intentionally ignored so the handler stays
+// usable in tests and behind middleware that does not expose deadlines.
+func newStreamDeadlineRefresher(w http.ResponseWriter, idleTimeoutMs int) func() {
+	if idleTimeoutMs <= 0 {
+		idleTimeoutMs = defaultStreamIdleTimeoutMs
+	}
+	idle := time.Duration(idleTimeoutMs) * time.Millisecond
+	rc := http.NewResponseController(w)
+
+	touch := func() {
+		_ = rc.SetWriteDeadline(time.Now().Add(idle))
+	}
+	touch()
+	return touch
+}
+
 // tryLocalStream attempts to initiate a stream with the local tier within ttft_timeout_ms.
 // The TTFT timer starts immediately and covers connection, headers, and the first body byte.
+//
+// On success it also returns the cancel func for the local context. Ownership is
+// handed to the caller because the local stream must outlive this call: the
+// caller cancels once the response body has been fully consumed.
 func (h *Handler) tryLocalStream(
 	ctx context.Context,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	targetModel string,
-) (*http.Response, []byte, int64, error) {
-	reqCopy := *chatReq
-	reqCopy.Model = targetModel
-	payload, err := json.Marshal(reqCopy)
+) (*http.Response, []byte, int64, context.CancelFunc, error) {
+	req.SetModel(targetModel)
+	payload, err := req.Marshal()
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
 
 	ttftTimeout := h.router.LocalTTFTTimeout()
@@ -347,7 +354,7 @@ func (h *Handler) tryLocalStream(
 	httpReq, err := http.NewRequestWithContext(localCtx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		localCancel()
-		return nil, nil, 0, err
+		return nil, nil, 0, nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if apiKey := h.router.LocalAPIKey(); apiKey != "" {
@@ -370,14 +377,14 @@ func (h *Handler) tryLocalStream(
 	select {
 	case <-ttftTimer.C:
 		localCancel()
-		return nil, nil, 0, fmt.Errorf("local TTFT timed out (%v) waiting for response headers", ttftTimeout)
+		return nil, nil, 0, nil, fmt.Errorf("local TTFT timed out (%v) waiting for response headers", ttftTimeout)
 	case <-ctx.Done():
 		localCancel()
-		return nil, nil, 0, ctx.Err()
+		return nil, nil, 0, nil, ctx.Err()
 	case res := <-doChan:
 		if res.err != nil {
 			localCancel()
-			return nil, nil, 0, fmt.Errorf("local connection failed: %w", res.err)
+			return nil, nil, 0, nil, fmt.Errorf("local connection failed: %w", res.err)
 		}
 		resp = res.resp
 	}
@@ -385,7 +392,7 @@ func (h *Handler) tryLocalStream(
 	if resp.StatusCode >= 400 {
 		resp.Body.Close()
 		localCancel()
-		return nil, nil, 0, fmt.Errorf("local returned status %d", resp.StatusCode)
+		return nil, nil, 0, nil, fmt.Errorf("local returned status %d", resp.StatusCode)
 	}
 
 	// Wait for the first non-empty byte/chunk before TTFT timer expires
@@ -408,33 +415,32 @@ func (h *Handler) tryLocalStream(
 	case <-ttftTimer.C:
 		resp.Body.Close()
 		localCancel()
-		return nil, nil, 0, fmt.Errorf("local TTFT timed out (%v) waiting for first chunk", ttftTimeout)
+		return nil, nil, 0, nil, fmt.Errorf("local TTFT timed out (%v) waiting for first chunk", ttftTimeout)
 	case <-ctx.Done():
 		resp.Body.Close()
 		localCancel()
-		return nil, nil, 0, ctx.Err()
+		return nil, nil, 0, nil, ctx.Err()
 	case rRes := <-readChan:
 		if rRes.err != nil && len(rRes.data) == 0 {
 			resp.Body.Close()
 			localCancel()
-			return nil, nil, 0, fmt.Errorf("local stream read error: %w", rRes.err)
+			return nil, nil, 0, nil, fmt.Errorf("local stream read error: %w", rRes.err)
 		}
 		// First chunk received successfully within TTFT timeout
 		ttftTimer.Stop()
 		ttft := time.Since(start).Milliseconds()
-		return resp, rRes.data, ttft, nil
+		return resp, rRes.data, ttft, localCancel, nil
 	}
 }
 
 // callCloudStream connects to the cloud fallback tier for streaming.
 func (h *Handler) callCloudStream(
 	ctx context.Context,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	targetModel string,
 ) (*http.Response, error) {
-	reqCopy := *chatReq
-	reqCopy.Model = targetModel
-	payload, err := json.Marshal(reqCopy)
+	req.SetModel(targetModel)
+	payload, err := req.Marshal()
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +472,7 @@ func (h *Handler) handleNonStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
 	reqID string,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	decision router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
@@ -475,12 +481,12 @@ func (h *Handler) handleNonStreaming(
 ) {
 	var finalTarget = decision.Target
 	var finalModel = decision.TargetModel
-	var rawRespBytes []byte
+	var rawResp []byte
 	var err error
 
 	// If Local was acquired, attempt call with TTFT/timeout
 	if decision.AcquiredLocal {
-		rawRespBytes, err = h.callLocalNonStreaming(r.Context(), chatReq, decision.TargetModel)
+		rawResp, err = h.callLocalNonStreaming(r.Context(), req, decision.TargetModel)
 		if err != nil {
 			log.Printf("[Proxy %s] Local non-streaming fallback: %v. Rerouting to Cloud.", reqID, err)
 			h.router.ReleaseLocal()
@@ -488,13 +494,13 @@ func (h *Handler) handleNonStreaming(
 			h.router.RecordFallback()
 
 			finalTarget = router.TargetCloud
-			finalModel = h.router.ResolveModel(router.TargetCloud, chatReq.Model)
+			finalModel = h.router.ResolveModel(router.TargetCloud, req.Model())
 		}
 	}
 
 	// Route to Cloud if local not used or fallback triggered
-	if rawRespBytes == nil {
-		rawRespBytes, err = h.callCloudNonStreaming(r.Context(), chatReq, finalModel)
+	if len(rawResp) == 0 {
+		rawResp, err = h.callCloudNonStreaming(r.Context(), req, finalModel)
 		if err != nil {
 			log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
 			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
@@ -512,41 +518,15 @@ func (h *Handler) handleNonStreaming(
 		}
 	}
 
-	// Parse upstream response
-	var completionResp ChatCompletionResponse
-	if err := json.Unmarshal(rawRespBytes, &completionResp); err != nil {
-		// If raw unmarshal failed, return raw rehydrated body
-		rehydrated := vault.Rehydrate(string(rawRespBytes))
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-EdgeCat-Route", finalTarget)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(rehydrated))
-		return
-	}
-
 	// 3. Contract Strict JSON Enforcement & Single Repair Loop
-	if strictJSON && len(completionResp.Choices) > 0 {
-		content := completionResp.Choices[0].Message.Content
-		repairedContent, _, guardErr := h.guard.EnforceAndRepair(r.Context(), content, func(ctx context.Context, broken string) (string, error) {
-			return h.invokeRepair(ctx, finalTarget, finalModel, broken)
-		})
-		if guardErr == nil {
-			completionResp.Choices[0].Message.Content = repairedContent
-		} else {
-			log.Printf("[Proxy %s] Strict JSON enforcement warning: %v", reqID, guardErr)
-		}
+	if strictJSON {
+		rawResp = h.enforceStrictJSON(r.Context(), reqID, finalTarget, finalModel, rawResp)
 	}
 
-	// 4. Rehydrate Vault Placeholders
-	for i := range completionResp.Choices {
-		completionResp.Choices[i].Message.Content = vault.Rehydrate(completionResp.Choices[i].Message.Content)
-	}
-
-	outBytes, err := json.Marshal(completionResp)
-	if err != nil {
-		http.Error(w, `{"error": "failed to encode response"}`, http.StatusInternalServerError)
-		return
-	}
+	// 4. Rehydrate Vault Placeholders on the raw payload.
+	// Re-encoding through typed structs here would silently strip tool_calls,
+	// reasoning_content and every vendor extension the upstream returned.
+	outBytes := RehydrateBody(vault, rawResp)
 
 	latencyMs := time.Since(startTime).Milliseconds()
 	w.Header().Set("Content-Type", "application/json")
@@ -561,21 +541,57 @@ func (h *Handler) handleNonStreaming(
 		RouteTarget:      finalTarget,
 		Model:            finalModel,
 		LatencyMs:        latencyMs,
-		TTFTMs:           latencyMs,
+		TTFTMs:           0, // whole-body responses have no first-token latency
 		PIIRedactedCount: piiRedacted,
 		Status:           http.StatusOK,
 		CreatedAt:        startTime,
 	})
 }
 
+// enforceStrictJSON strips code fences from choices[0].message.content and
+// triggers at most one bounded repair call. It only rewrites that single field
+// and returns the payload untouched on any structural surprise, so unknown
+// response fields survive the round trip.
+func (h *Handler) enforceStrictJSON(
+	ctx context.Context,
+	reqID, target, model string,
+	raw []byte,
+) []byte {
+	obj, ok := decodeObject(raw)
+	if !ok {
+		return raw
+	}
+	content, ok := firstChoiceContent(obj)
+	if !ok {
+		return raw
+	}
+
+	repaired, _, guardErr := h.guard.EnforceAndRepair(ctx, content, func(callCtx context.Context, broken string) (string, error) {
+		return h.invokeRepair(callCtx, target, model, broken)
+	})
+	if guardErr != nil {
+		log.Printf("[Proxy %s] Strict JSON enforcement warning: %v", reqID, guardErr)
+		return raw
+	}
+	if !setFirstChoiceContent(obj, repaired) {
+		return raw
+	}
+
+	out, err := marshalObject(obj)
+	if err != nil {
+		log.Printf("[Proxy %s] Strict JSON re-encode failed: %v", reqID, err)
+		return raw
+	}
+	return out
+}
+
 func (h *Handler) callLocalNonStreaming(
 	ctx context.Context,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	targetModel string,
 ) ([]byte, error) {
-	reqCopy := *chatReq
-	reqCopy.Model = targetModel
-	payload, err := json.Marshal(reqCopy)
+	req.SetModel(targetModel)
+	payload, err := req.Marshal()
 	if err != nil {
 		return nil, err
 	}
@@ -604,17 +620,23 @@ func (h *Handler) callLocalNonStreaming(
 		return nil, fmt.Errorf("local returned status %d", resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) == 0 {
+		return nil, errors.New("local returned empty body")
+	}
+	return body, nil
 }
 
 func (h *Handler) callCloudNonStreaming(
 	ctx context.Context,
-	chatReq *ChatCompletionRequest,
+	req *Request,
 	targetModel string,
 ) ([]byte, error) {
-	reqCopy := *chatReq
-	reqCopy.Model = targetModel
-	payload, err := json.Marshal(reqCopy)
+	req.SetModel(targetModel)
+	payload, err := req.Marshal()
 	if err != nil {
 		return nil, err
 	}
@@ -651,41 +673,28 @@ func (h *Handler) invokeRepair(
 	ctx context.Context,
 	target, model, broken string,
 ) (string, error) {
-	repairReq := ChatCompletionRequest{
-		Model: model,
-		Messages: []ChatMessage{
-			{
-				Role:    "system",
-				Content: "You are a strict JSON repair engine. Output ONLY syntactically valid JSON. Do not include markdown code blocks, explanation, or commentary.",
-			},
-			{
-				Role:    "user",
-				Content: fmt.Sprintf("The following output was malformed JSON:\n%s\nRepair it and return ONLY valid JSON:", broken),
-			},
-		},
-		Stream: false,
-	}
+	repairReq := newRepairRequest(model, broken)
 
 	var data []byte
 	var err error
 	if target == router.TargetLocal {
-		data, err = h.callLocalNonStreaming(ctx, &repairReq, model)
+		data, err = h.callLocalNonStreaming(ctx, repairReq, model)
 	} else {
-		data, err = h.callCloudNonStreaming(ctx, &repairReq, model)
+		data, err = h.callCloudNonStreaming(ctx, repairReq, model)
 	}
 	if err != nil {
 		return "", err
 	}
 
-	var resp ChatCompletionResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", err
+	obj, ok := decodeObject(data)
+	if !ok {
+		return "", errors.New("repair response is not a JSON object")
 	}
-	if len(resp.Choices) == 0 {
+	content, ok := firstChoiceContent(obj)
+	if !ok {
 		return "", errors.New("empty repair response")
 	}
-
-	return resp.Choices[0].Message.Content, nil
+	return content, nil
 }
 
 func generateRequestID() string {

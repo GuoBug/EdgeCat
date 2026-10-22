@@ -5,12 +5,12 @@
   <b>中文</b>
 </p>
 
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![CGO_ENABLED](https://img.shields.io/badge/CGO_ENABLED-0-success?style=flat)]()
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-Local--First_Dual--Track-orange)]()
 
-> **EdgeCat** 是一个轻量级、确定性、本地优先的 AI 推理治理网关，使用 Go 1.22+ 编写并实现 `CGO_ENABLED=0` 纯静态编译。  
+> **EdgeCat** 是一个轻量级、确定性、本地优先的 AI 推理治理网关，使用 Go 1.26+ 编写并实现 `CGO_ENABLED=0` 纯静态编译。  
 > 专为解决边缘/本地模型（如 Ollama、vLLM、llama.cpp）与云端保底端点之间的流式治理、敏感信息过滤、冷启动超时熔断及审计入库而构建。
 
 ---
@@ -23,7 +23,7 @@
 3. **输出格式失控**：模型常常无视 `response_format` 强行包裹 ````json 代码块，破坏下游反序列化契约；
 4. **同步写日志拖慢推理延迟**：传统网关在 HTTP 协程中同步写入数据库，导致首字耗时（TTFT）劣化。
 
-**EdgeCat 通过以下五大确定性机制彻底化解上述痛点：**
+**EdgeCat 通过以下六大确定性机制彻底化解上述痛点：**
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -66,7 +66,7 @@
 
 ---
 
-## 五大核心架构支柱
+## 六大核心架构支柱
 
 ### 1. 滑动窗口流式还原 (Sliding-Window SSE Rehydration)
 - **掩码阶段**：请求进入时，提取手机号、邮箱、内网 IPv4 及各类 API Key，替换为确定性占位符 `{{EC_PII_<TYPE>_<INDEX>}}`（同值去重，保持上下文一致性），原值隔离保存在当前 Context 的 `Vault` 中。
@@ -81,12 +81,18 @@
 - 路由至 Local Tier 时自动重写为配置的本地模型名（如 `qwen2.5:7b`），降级至 Cloud Tier 时重写为云端模型名，并正确重新计算 HTTP `Content-Length` 与路由标头。
 
 ### 4. 契约校验与单次自修复闭环 (Strict JSON Guard & Repair Loop)
-- 当请求包含 `response_format: {"type": "json_object"}` 或标头 `X-EdgeCat-Strict-JSON: true` 时，自动剥离输出中多余的 ````json / ```` Markdown 代码块标签与空白注释。
+- 由 `contract.strict_json_enabled` 作为总开关；开关打开后，当请求包含 `response_format: {"type": "json_object"}` 或标头 `X-EdgeCat-Strict-JSON: true` 时，自动剥离输出中多余的 ````json / ```` Markdown 代码块标签与空白注释。
 - 若提取后校验仍不合法，受控触发最多 1 次单轮 Prompt 修复调用（带超时限制），杜绝递归死循环。
+- **作用范围限于非流式整包响应**：契约自修复需要对完整响应做缓冲与二次调用，与流式首字延迟目标直接冲突，因此 SSE 流式响应不做契约修复（保持首字优先）。
 
 ### 5. 无锁异步 SQLite 批量审计 (Async Batch SQLite Logger)
 - 引入纯 Go 编写的 `modernc.org/sqlite`，连接初始化时显式开启 `_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)`。
 - HTTP 协程仅需向有界 Channel（默认 10,000 容量）发送审计条目，耗时趋近于 0，写满时自动丢弃保护低延迟；后台唯一 Worker 协程按批量阈值（如 50 条）或定时器聚合单事务落库。
+
+### 6. 协议无损透传 (Lossless Wire Passthrough)
+- 请求与响应全程不做"结构体重建"：网关只改写它真正要改的字段（`model` 别名重写、被脱敏的文本），其余字段（`tools`、`tool_choice`、`top_p`、`presence_penalty`、`seed`、厂商私有扩展）原样透传；响应侧直接在原始字节上还原占位符，不再"反序列化进结构体再编码回去"。
+- 因此 `tools` / `tool_calls` / `reasoning_content`（DeepSeek 等推理模型）/ `logprobs` / 多模态 `content` 数组均可无损穿过，工具调用与多模态客户端无需改造。
+- 数值统一以 `json.Number` 承载，`created` 一类整数字面量不会被 float64 重新格式化成科学计数法；多模态 `content` 数组只对其中的 `text` 块做脱敏，图片/音频负载原样转发。
 
 ---
 
@@ -114,6 +120,9 @@ go test -v ./...
 server:
   host: "0.0.0.0"
   port: 8080
+  write_timeout_ms: 120000
+  # SSE 专用：长流按"空闲时长"而非"总时长"限流，本地慢速模型可长时间持续输出
+  stream_idle_timeout_ms: 300000
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"
@@ -157,12 +166,31 @@ audit:
 
 ## 接口说明与生态接入 (Endpoints & Compatibility)
 
-EdgeCat 100% 兼容 **OpenAI ChatCompletion 协议**（支持零改造即插即用）：
+EdgeCat 兼容 **OpenAI ChatCompletion 协议** 的基础对话与工具调用语义，可零改造接入：
 - **`POST /v1/chat/completions`**：支持标准非流式 JSON 及实时 SSE 流式（`stream: true`）传输。
+- **协议覆盖范围**：`tools` / `tool_choice` / `tool_calls` / `reasoning_content` / 多模态 `content` 数组 / `temperature` / `top_p` / `max_tokens` / `seed` 等字段均可无损透传。
+- **尚未实现**：`/v1/embeddings`、`/v1/completions`、`/v1/responses` 等其它端点（请求返回 404）。
 - **`GET /health`**：实时返回本地/云端端点状态、本地活动信号量并发数、累计降级次数以及异步审计日志吞吐指标。
 - **`GET /v1/models`**：提供 OpenAI 兼容的模型列表发现。
 
-> 💡 **架构决策沉淀**：关于为什么全面采用 OpenAI 兼容协议而非私有 REST、以及其与 OpenAPI 的概念辨析，详见架构决策记录 [ADR-0001: 采用 OpenAI 兼容协议作为核心通信协议](docs/adr/0001-openai-wire-protocol_zh.md)。
+> 💡 **架构决策与演进路线沉淀**：
+> - [ADR-0001: 采用 OpenAI 兼容协议作为核心通信协议](docs/adr/0001-openai-wire-protocol_zh.md)（OpenAI Wire Protocol 与 OpenAPI 概念辨析）
+> - [ADR-0002: 确立“治理网关本体 + 家庭/小团队内网共享”定位与安全威胁模型](docs/adr/0002-positioning-and-homelab-governance_zh.md)（为什么网关是本体、NAS 局域网共享边界与零落盘威胁模型）
+> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（Phase 1.5 已完成项与 Phase 2 内网多端鉴权/云端降级配额规划）
+
+---
+
+## 典型部署形态与安全边界 (Deployment Topologies & Security Model)
+
+EdgeCat 秉持 **“网关是本体，中枢是用法”** 的极简工程哲学，专注做好横切流式治理层，主要面向以下两类场景（**严禁在无鉴权与 TLS 保护下直接暴露于公网**）：
+
+1. **个人工作站本地守护进程（Localhost Sidecar）**  
+   常驻本机 `127.0.0.1:8080`，作为 **PatchCat**（前端可视化 DAG 工作流编排器）、IDE 助手与 CLI 工具的本地算力与隐私底座。对外分享工作流时仅导出不含密钥的 PatchCat DAG JSON，各自连接本机 EdgeCat。
+2. **家庭 / 小团队内网共享网关（Homelab / NAS LAN Gateway）**  
+   单二进制直接部署在家庭 NAS、Mac mini 或软路由上，供家庭或 2~3 人极客团队的多台设备局域网共用：
+   - **统一密钥托管**：云端主 API Key 锁在 NAS 配置文件中，客户端仅持按设备签发的轻量令牌（Phase 2）；
+   - **本地免费无限白嫖，云端降级硬配额**：日常请求优先白嫖内网免费 GPU（Ollama），触发付费云端降级时按设备执行每日限额并分账审计，杜绝前端 XSS 或 Agent 死循环刷爆账单；
+   - **零隐私落盘威胁模型**：PII `Vault` 为 100% 单请求内存生命周期（请求结束即销毁），`audit_logs` 仅记录脱敏计数、路由去向与延迟指标，绝不落盘原始对话内容与敏感词明文，从根源上消除数据库副本离线泄露风险。
 
 ### 客户端零侵入接入示例：
 - **桌面与 Web 客户端 (Chatbox / Cherry Studio / NextChat)**：

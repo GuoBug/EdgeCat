@@ -1,4 +1,4 @@
-﻿// Package config provides configuration parsing and defaults for EdgeCat.
+// Package config provides configuration parsing and defaults for EdgeCat.
 //
 // Copyright (c) 2026 Guo Qiang.
 // Distributed under the terms of the Apache License 2.0.
@@ -31,6 +31,10 @@ type ServerConfig struct {
 	Port           int    `yaml:"port" json:"port"`
 	ReadTimeoutMs  int    `yaml:"read_timeout_ms" json:"read_timeout_ms"`
 	WriteTimeoutMs int    `yaml:"write_timeout_ms" json:"write_timeout_ms"`
+	// StreamIdleTimeoutMs replaces WriteTimeoutMs on SSE responses. A stream is
+	// bounded by how long it stays silent, not by its total duration, so a slow
+	// local model can stream for as long as it keeps producing tokens.
+	StreamIdleTimeoutMs int `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
 }
 
 // LocalConfig configures the local inference tier (e.g., Ollama / vLLM / llama.cpp).
@@ -78,10 +82,11 @@ type AuditConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Host:           "0.0.0.0",
-			Port:           8080,
-			ReadTimeoutMs:  30000,
-			WriteTimeoutMs: 120000,
+			Host:                "0.0.0.0",
+			Port:                8080,
+			ReadTimeoutMs:       30000,
+			WriteTimeoutMs:      120000,
+			StreamIdleTimeoutMs: 300000,
 		},
 		Local: LocalConfig{
 			Endpoint:           "http://127.0.0.1:11434/v1",
@@ -155,6 +160,9 @@ func applySanityChecks(cfg *Config) {
 	}
 	if cfg.Local.MaxConcurrentLocal <= 0 {
 		cfg.Local.MaxConcurrentLocal = 1
+	}
+	if cfg.Server.StreamIdleTimeoutMs <= 0 {
+		cfg.Server.StreamIdleTimeoutMs = 300000
 	}
 	if cfg.Local.TTFTTimeoutMs <= 0 {
 		cfg.Local.TTFTTimeoutMs = 3500
