@@ -156,32 +156,17 @@ Start the gateway:
 
 ---
 
-## Protocol Design: Why the OpenAI-Compatible API?
+## Endpoints & Ecosystem Integration
 
-A fundamental architectural decision when designing EdgeCat was: **Should the gateway introduce a bespoke proprietary API, or adopt an established industry standard?**
-
-EdgeCat strictly aligns with the **OpenAI-Compatible Wire Protocol** (`POST /v1/chat/completions`).
-
-### 1. Conceptual Disambiguation: OpenAI-Compatible API vs. OpenAPI (Swagger)
-These two similar-sounding terms are frequently conflated:
-- **OpenAI-Compatible API**: The de facto wire protocol established by OpenAI for large language models, specifying endpoints (`POST /v1/chat/completions`), payload schemas (`model`, `messages`, `role`, `content`), and Server-Sent Events streaming semantics (`data: {...}`). It serves as the universal **"Type-C interface"** of the generative AI ecosystem.
-- **OpenAPI Specification (OAS, formerly Swagger)**: A machine-readable format (YAML/JSON) used to document and describe generic RESTful APIs. It defines API schema standards, but does not prescribe AI-specific conversational semantics.
-
-### 2. Why EdgeCat Adopts the OpenAI-Compatible API
-1. **Zero-Code Drop-In Proxy (Zero Invasiveness)**:  
-   Existing production applications, Agent frameworks (LangChain, LlamaIndex, Dify, AutoGen), desktop/web clients (Chatbox, Cherry Studio, NextChat), and official SDKs (`import openai` in Python/Node.js) require **zero application code changes**. Users simply redirect their client `Base URL` to `http://localhost:8080/v1` to instantly gain PII redacting, local-to-cloud circuit-breaker failover, and lock-free SQLite auditing.
-2. **Universal Local-to-Cloud Interoperability**:  
-   Both modern local runtimes (Ollama, vLLM, llama.cpp, LocalAI) and enterprise cloud APIs (DeepSeek, Qwen/DashScope, Moonshot/Kimi, Zhipu GLM, OpenAI) share this identical wire protocol. EdgeCat operates as a transparent, high-performance governance middlebox between any OpenAI-compatible client and any OpenAI-compatible inference backend.
-
-### 3. Supported Endpoints & Ecosystem Setup
-
-EdgeCat exposes the following standardized governance endpoints:
+EdgeCat is 100% wire-compatible with the **OpenAI ChatCompletion Protocol** for zero-code drop-in proxying:
 - **`POST /v1/chat/completions`**: Supports standard JSON responses and low-latency SSE streaming (`stream: true`).
 - **`GET /health`**: Returns real-time health metrics, active concurrency slots, fallback statistics, and audit pipeline throughput.
 - **`GET /v1/models`**: Provides OpenAI-compatible model catalog discovery.
 
-#### Client Setup Example:
-- **Chatbox / Cherry Studio / NextChat**:
+> 💡 **Architectural Decision Record**: For detailed trade-offs, rationale on avoiding custom REST, and disambiguation from OpenAPI (Swagger), see [ADR-0001: Adoption of OpenAI-Compatible Wire Protocol](docs/adr/0001-openai-wire-protocol.md).
+
+### Zero-Invasiveness Client Setup:
+- **Desktop & Web Clients (Chatbox / Cherry Studio / NextChat)**:
   - API Provider: Select `OpenAI API`
   - Base URL: `http://localhost:8080/v1`
   - API Key: Any value (e.g., `none`)
@@ -189,9 +174,11 @@ EdgeCat exposes the following standardized governance endpoints:
   ```python
   from openai import OpenAI
 
+  # Simply point Base URL to EdgeCat; zero business code changes required
   client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
+
   response = client.chat.completions.create(
-      model="gpt-4o-mini",
+      model="gpt-4o-mini",  # Logical model name rewritten dynamically by gateway
       messages=[{"role": "user", "content": "My phone is 13800138000"}],
       stream=True,
   )
