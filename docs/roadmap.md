@@ -58,7 +58,7 @@ This document tracks **EdgeCat**'s product positioning, completed architectural 
 | **D2** | **Quota counter durability**: an in-memory atomic counter resets to zero on restart, and NAS boxes reboot — so the daily quota can be bypassed by restarting the process | Persist daily counters in SQLite (one row per client per day) and load on startup; keep memory only as a hot-path cache | R2.3 / R2.5 |
 | **D3** | **Failure semantics of `daily_cloud_limit: -1`**: what to return when the local tier is unavailable and the client is forbidden from using cloud | Return `503 Service Unavailable` with an explicit message (local unavailable and cloud fallback disabled for this client), not a generic `429` | R2.3 |
 | **D4** | **Quota day boundary timezone**: reset at UTC midnight or server-local midnight | Use server-local time (what homelab users expect) and expose the next reset timestamp in `/health` | R2.3 |
-| **D5** | **`/v1/models` is still hardcoded**: it returns three fixed model names, so multi-device clients (Cherry Studio et al.) cannot discover the logical models configured on this gateway, while physical model names leak | Derive the logical model list from the keys of `local.model_mapping` / `cloud.model_mapping`; never expose physical names via discovery | Prerequisite for R2.4 (client usability) |
+| **D5** | **`/v1/models` is still hardcoded**: it returns three fixed model names, so multi-device clients (Cherry Studio et al.) cannot discover the logical models configured on this gateway, while physical model names leak | Derive the logical model list from the keys of `local.model_mapping` / `cloud.model_mapping`; never expose physical names via discovery | Phase 2 prerequisite (multi-device usability) |
 
 ---
 

@@ -176,7 +176,7 @@ EdgeCat 兼容 **OpenAI ChatCompletion 协议** 的基础对话与工具调用�
 > 💡 **架构决策与演进路线沉淀**：
 > - [ADR-0001: 采用 OpenAI 兼容协议作为核心通信协议](docs/adr/0001-openai-wire-protocol_zh.md)（OpenAI Wire Protocol 与 OpenAPI 概念辨析）
 > - [ADR-0002: 确立“治理网关本体 + 家庭/小团队内网共享”定位与安全威胁模型](docs/adr/0002-positioning-and-homelab-governance_zh.md)（为什么网关是本体、NAS 局域网共享边界与零落盘威胁模型）
-> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（Phase 1.5 已完成项与 Phase 2 内网多端鉴权/云端降级配额规划）
+> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（Phase 1.5 已完成项、Phase 2 内网多端鉴权/云端降级配额规划，以及 5 项开工前待定的设计约束）
 
 ---
 

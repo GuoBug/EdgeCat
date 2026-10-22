@@ -178,7 +178,7 @@ EdgeCat is wire-compatible with the **OpenAI ChatCompletion Protocol** for chat 
 > 💡 **Architecture Decision Records & Roadmap**:
 > - [ADR-0001: Adoption of OpenAI-Compatible Wire Protocol](docs/adr/0001-openai-wire-protocol.md) (Wire Protocol vs. OpenAPI/Swagger disambiguation)
 > - [ADR-0002: Product Positioning, Homelab LAN Sharing & Threat Model](docs/adr/0002-positioning-and-homelab-governance.md) ("Gateway as Core, Hub as Usage", NAS LAN sharing boundaries, and zero-disk PII threat model)
-> - [EdgeCat Requirements Backlog & Evolution Roadmap](docs/roadmap.md) (Completed Phase 1.5 core & Phase 2 LAN sub-token/cloud-fallback quota specifications)
+> - [EdgeCat Requirements Backlog & Evolution Roadmap](docs/roadmap.md) (Completed Phase 1.5 core, Phase 2 LAN sub-token/cloud-fallback quota specifications, and 5 open design constraints to resolve before coding)
 
 ---
 
