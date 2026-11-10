@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/patchcat-dev/edgecat/internal/config"
 	"github.com/patchcat-dev/edgecat/internal/contract"
 	"github.com/patchcat-dev/edgecat/internal/filter"
+	"github.com/patchcat-dev/edgecat/internal/quota"
 	"github.com/patchcat-dev/edgecat/internal/router"
 )
 
@@ -37,6 +40,7 @@ type Handler struct {
 	router     *router.Router
 	guard      *contract.Guard
 	audit      *audit.Logger
+	quotaMgr   *quota.Manager
 	httpClient *http.Client
 }
 
@@ -47,6 +51,7 @@ func NewHandler(
 	r *router.Router,
 	g *contract.Guard,
 	a *audit.Logger,
+	qm *quota.Manager,
 ) *Handler {
 	client := &http.Client{
 		Timeout: 0, // Individual request contexts manage timeouts
@@ -57,22 +62,111 @@ func NewHandler(
 		router:     r,
 		guard:      g,
 		audit:      a,
+		quotaMgr:   qm,
 		httpClient: client,
 	}
 }
 
 // ServeHTTP handles /v1/chat/completions, /health, and /v1/models.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/health":
+	// Handle CORS & Chrome Private Network Access preflights
+	if h.handleCORS(w, r) {
+		return
+	}
+
+	// /health is public for liveness checks (does not leak sensitive configs)
+	if r.URL.Path == "/health" {
 		h.handleHealth(w, r)
+		return
+	}
+
+	// Validate client auth token if enabled
+	client, authed := h.authenticate(r)
+	if !authed {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "unauthorized: valid Bearer token required in Authorization header",
+				"type":    "invalid_request_error",
+				"code":    "invalid_api_key",
+			},
+		})
+		return
+	}
+
+	switch {
 	case r.URL.Path == "/v1/models" && r.Method == http.MethodGet:
 		h.handleModels(w, r)
 	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
-		h.handleChatCompletions(w, r)
+		h.handleChatCompletions(w, r, client)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleCORS sets CORS headers and handles OPTIONS preflights including Chrome PNA.
+// It returns true if the request was an OPTIONS preflight and has been fully served.
+func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		allowed := false
+		if len(h.cfg.Server.AllowedOrigins) == 0 {
+			// If no allowlist is configured, permit all origins (standard for local sidecars)
+			allowed = true
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else {
+			for _, o := range h.cfg.Server.AllowedOrigins {
+				if o == "*" || strings.EqualFold(o, origin) {
+					allowed = true
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					break
+				}
+			}
+		}
+
+		if allowed {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EdgeCat-Strict-JSON, Access-Control-Request-Private-Network")
+			w.Header().Set("Access-Control-Expose-Headers", "X-EdgeCat-Route, Content-Length")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+
+			// Chrome Private Network Access (PNA) preflight support
+			if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
+		}
+	}
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
+// authenticate validates the Authorization: Bearer <token> header against configured clients.
+func (h *Handler) authenticate(r *http.Request) (*config.ClientConfig, bool) {
+	if !h.cfg.Auth.Enabled {
+		// Anonymous client when auth is disabled
+		return &config.ClientConfig{Name: "anonymous"}, true
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return nil, false
+	}
+	rawToken := strings.TrimSpace(authHeader[7:])
+	if rawToken == "" {
+		return nil, false
+	}
+
+	for _, c := range h.cfg.Auth.Clients {
+		if subtle.ConstantTimeCompare([]byte(c.Token), []byte(rawToken)) == 1 {
+			return &c, true
+		}
+	}
+	return nil, false
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -95,26 +189,62 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	if h.quotaMgr != nil {
+		resp["clients_usage"] = h.quotaMgr.ClientUsageSummary()
+		resp["next_quota_reset"] = h.quotaMgr.NextResetTime().Format(time.RFC3339)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
+	// D5: Dynamically derive logical model IDs from local and cloud mappings.
+	// Physical model names (such as "qwen2.5:7b" or local paths) are never leaked.
+	modelSet := make(map[string]struct{})
+	modelSet["default"] = struct{}{}
+
+	if h.cfg.Local.ModelMapping != nil {
+		for logical := range h.cfg.Local.ModelMapping {
+			if logical != "" {
+				modelSet[logical] = struct{}{}
+			}
+		}
+	}
+	if h.cfg.Cloud.ModelMapping != nil {
+		for logical := range h.cfg.Cloud.ModelMapping {
+			if logical != "" {
+				modelSet[logical] = struct{}{}
+			}
+		}
+	}
+
+	modelList := make([]string, 0, len(modelSet))
+	for m := range modelSet {
+		modelList = append(modelList, m)
+	}
+	sort.Strings(modelList)
+
+	data := make([]map[string]any, 0, len(modelList))
+	for _, m := range modelList {
+		data = append(data, map[string]any{
+			"id":       m,
+			"object":   "model",
+			"owned_by": "edgecat",
+		})
+	}
+
 	resp := map[string]any{
 		"object": "list",
-		"data": []map[string]any{
-			{"id": "default", "object": "model", "owned_by": "edgecat"},
-			{"id": "gpt-4o-mini", "object": "model", "owned_by": "edgecat"},
-			{"id": "qwen2.5:7b", "object": "model", "owned_by": "edgecat"},
-		},
+		"data":   data,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, client *config.ClientConfig) {
 	startTime := time.Now()
 	requestID := generateRequestID()
 
@@ -155,9 +285,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	strictJSON := h.guard.StrictJSONEnabled && clientWantsStrictJSON(r, req)
 
 	if req.Stream() {
-		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted)
+		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, client)
 	} else {
-		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON)
+		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON, client)
 	}
 }
 
@@ -179,6 +309,7 @@ func (h *Handler) handleStreaming(
 	vault *filter.Vault,
 	startTime time.Time,
 	piiRedacted int,
+	client *config.ClientConfig,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -222,12 +353,36 @@ func (h *Handler) handleStreaming(
 
 	// If not routed to local or local timed out, route to Cloud
 	if upstreamResp == nil {
+		clientName := "anonymous"
+		if client != nil && client.Name != "" {
+			clientName = client.Name
+		}
+
+		// D1 & R2.3: Check cloud quota in the pre-WriteHeader window
+		if h.quotaMgr != nil {
+			status := h.quotaMgr.CheckAndIncrementCloud(clientName)
+			if status == quota.StatusLocalOnlyDisallowed {
+				// D3: daily_cloud_limit: -1 returns 503 Service Unavailable
+				http.Error(w, `{"error":{"message":"local tier unavailable and cloud fallback is disallowed for client","type":"service_unavailable_error","code":"cloud_fallback_disabled"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			if status == quota.StatusQuotaExceeded {
+				http.Error(w, `{"error":{"message":"daily cloud fallback quota exceeded for client","type":"insufficient_quota","code":"daily_cloud_limit_exceeded"}}`, http.StatusTooManyRequests)
+				return
+			}
+		}
+
 		cloudResp, err := h.callCloudStream(r.Context(), req, finalModel)
 		if err != nil {
 			log.Printf("[Proxy %s] Cloud fallback error: %v", reqID, err)
 			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
+			clientName := "anonymous"
+			if client != nil && client.Name != "" {
+				clientName = client.Name
+			}
 			h.audit.Log(&audit.Record{
 				RequestID:        reqID,
+				ClientName:       clientName,
 				RouteTarget:      finalTarget,
 				Model:            finalModel,
 				LatencyMs:        time.Since(startTime).Milliseconds(),
@@ -294,8 +449,13 @@ func (h *Handler) handleStreaming(
 	}
 
 	// Log audit record asynchronously
+	clientName := "anonymous"
+	if client != nil && client.Name != "" {
+		clientName = client.Name
+	}
 	h.audit.Log(&audit.Record{
 		RequestID:        reqID,
+		ClientName:       clientName,
 		RouteTarget:      finalTarget,
 		Model:            finalModel,
 		LatencyMs:        time.Since(startTime).Milliseconds(),
@@ -478,6 +638,7 @@ func (h *Handler) handleNonStreaming(
 	startTime time.Time,
 	piiRedacted int,
 	strictJSON bool,
+	client *config.ClientConfig,
 ) {
 	var finalTarget = decision.Target
 	var finalModel = decision.TargetModel
@@ -500,12 +661,32 @@ func (h *Handler) handleNonStreaming(
 
 	// Route to Cloud if local not used or fallback triggered
 	if len(rawResp) == 0 {
+		clientName := "anonymous"
+		if client != nil && client.Name != "" {
+			clientName = client.Name
+		}
+
+		// D1 & R2.3: Check cloud quota in pre-WriteHeader window
+		if h.quotaMgr != nil {
+			status := h.quotaMgr.CheckAndIncrementCloud(clientName)
+			if status == quota.StatusLocalOnlyDisallowed {
+				// D3: daily_cloud_limit: -1 returns 503
+				http.Error(w, `{"error":{"message":"local tier unavailable and cloud fallback is disallowed for client","type":"service_unavailable_error","code":"cloud_fallback_disabled"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			if status == quota.StatusQuotaExceeded {
+				http.Error(w, `{"error":{"message":"daily cloud fallback quota exceeded for client","type":"insufficient_quota","code":"daily_cloud_limit_exceeded"}}`, http.StatusTooManyRequests)
+				return
+			}
+		}
+
 		rawResp, err = h.callCloudNonStreaming(r.Context(), req, finalModel)
 		if err != nil {
 			log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
 			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
 			h.audit.Log(&audit.Record{
 				RequestID:        reqID,
+				ClientName:       clientName,
 				RouteTarget:      finalTarget,
 				Model:            finalModel,
 				LatencyMs:        time.Since(startTime).Milliseconds(),
@@ -536,8 +717,13 @@ func (h *Handler) handleNonStreaming(
 	_, _ = w.Write(outBytes)
 
 	// Async SQLite audit
+	clientName := "anonymous"
+	if client != nil && client.Name != "" {
+		clientName = client.Name
+	}
 	h.audit.Log(&audit.Record{
 		RequestID:        reqID,
+		ClientName:       clientName,
 		RouteTarget:      finalTarget,
 		Model:            finalModel,
 		LatencyMs:        latencyMs,

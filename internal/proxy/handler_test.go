@@ -23,6 +23,7 @@ import (
 	"github.com/patchcat-dev/edgecat/internal/contract"
 	"github.com/patchcat-dev/edgecat/internal/filter"
 	"github.com/patchcat-dev/edgecat/internal/proxy"
+	"github.com/patchcat-dev/edgecat/internal/quota"
 	"github.com/patchcat-dev/edgecat/internal/router"
 )
 
@@ -37,10 +38,15 @@ func newTestHandler(t *testing.T, cfg *config.Config) *proxy.Handler {
 	}
 	t.Cleanup(func() { _ = logger.Close() })
 
+	qm, err := quota.NewManager(logger.DB(), cfg.Auth.Clients)
+	if err != nil {
+		t.Fatalf("init quota manager: %v", err)
+	}
+
 	masker := filter.NewMasker(cfg.Filter.MaskPhone, cfg.Filter.MaskEmail, cfg.Filter.MaskIPv4, cfg.Filter.MaskAPIKey)
 	guard := contract.NewGuard(cfg.Contract.StrictJSONEnabled, cfg.Contract.MaxRepairAttempts, cfg.Contract.RepairTimeoutMs)
 
-	return proxy.NewHandler(cfg, masker, router.NewRouter(cfg), guard, logger)
+	return proxy.NewHandler(cfg, masker, router.NewRouter(cfg), guard, logger, qm)
 }
 
 // postChatCompletion sends a raw JSON body to the chat completions endpoint.

@@ -36,17 +36,18 @@ This document tracks **EdgeCat**'s product positioning, completed architectural 
 
 ---
 
-### 🚧 Phase 2: Homelab / Small-Team LAN Sharing & PatchCat Sidecar Security (Next Up)
+### ✅ Phase 2: Homelab / Small-Team LAN Sharing & PatchCat Sidecar Security (Completed)
 
 > **Goal**: Enable safe multi-device LAN sharing on a NAS/home server and browser-based PatchCat pairing with zero UI bloat.
 
-| ID | Feature | Detailed Engineering Specification | Priority |
+| ID | Feature | Detailed Engineering Specification | Status |
 | :--- | :--- | :--- | :---: |
-| **R2.1** | **Secure-by-Default & Fail-Closed LAN Guard** | 1. Tighten default `server.host` to `"127.0.0.1"`.<br>2. **Startup Fail-Closed Check**: When `server.host` is bound to a non-loopback address (e.g., `"0.0.0.0"` or LAN IP) and `auth.enabled` is false (or no client tokens are configured), refuse startup with an actionable error unless `allow_insecure_lan: true` is explicitly set. | **P0** |
-| **R2.2** | **Per-Device Sub-Token Authentication (`auth.clients`)** | 1. Configure named client tokens in `edgecat.yaml` (`name`, `token`).<br>2. Validate `Authorization: Bearer <token>` using constant-time comparison (`subtle.ConstantTimeCompare`); return `401 Unauthorized` on mismatch.<br>3. Keep `GET /health` accessible for liveness checks without leaking sensitive secrets. | **P0** |
-| **R2.3** | **Dual-Track Quota: Unlimited Local, Capped Cloud (`daily_cloud_limit`)** | 1. Support per-client `daily_cloud_limit` (`0` = unlimited, `-1` = local-only / cloud forbidden, `>0` = max daily cloud calls).<br>2. **Core Invariant**: Requests served by the free **Local Tier** consume zero quota. Quota is checked and atomically incremented only when dispatching or falling back to the paid **Cloud Tier** (auto-resetting daily).<br>3. Return `429 Too Many Requests` when a client's daily cloud fallback quota is exhausted. | **P0** |
-| **R2.4** | **Controlled CORS & Chrome PNA Preflight** | 1. Configure `server.allowed_origins` allowlist (e.g., `https://patchcat.dev`, `http://localhost:5173`).<br>2. Handle `OPTIONS` preflight requests (`204 No Content`).<br>3. Support Chrome Private Network Access: respond with `Access-Control-Allow-Private-Network: true` when `Access-Control-Request-Private-Network: true` is present, allowing HTTPS web apps to reach LAN/localhost EdgeCat instances safely. | **P1** |
-| **R2.5** | **Per-Client SQLite Audit Attribution** | 1. Add `client_name TEXT NOT NULL DEFAULT 'anonymous'` to `audit_logs` (with idempotent startup schema migration for existing DBs).<br>2. Expose per-client daily local/cloud counters and remaining cloud quota in `GET /health`. | **P1** |
+| **D5** | **Dynamic Model Discovery & Physical Name Shielding** | Derive `/v1/models` dynamically from `local.model_mapping` and `cloud.model_mapping` keys, preventing internal physical model names (e.g. `qwen2.5:7b`) from leaking. | ✅ Completed |
+| **R2.1** | **Secure-by-Default & Fail-Closed LAN Guard** | 1. Tighten default `server.host` to `"127.0.0.1"`.<br>2. **Startup Fail-Closed Check**: When `server.host` is bound to a non-loopback address (e.g., `"0.0.0.0"` or LAN IP) and `auth.enabled` is false (or no client tokens are configured), refuse startup with an actionable error unless `allow_insecure_lan: true` is set. | ✅ Completed |
+| **R2.2** | **Per-Device Sub-Token Authentication (`auth.clients`)** | 1. Configure named client tokens in `edgecat.yaml` (`name`, `token`).<br>2. Validate `Authorization: Bearer <token>` using constant-time comparison (`subtle.ConstantTimeCompare`); return `401 Unauthorized` on mismatch.<br>3. Keep `GET /health` accessible for liveness checks without leaking sensitive secrets. | ✅ Completed |
+| **R2.3** | **Dual-Track Quota: Unlimited Local, Capped Cloud (`daily_cloud_limit`)** | 1. Support per-client `daily_cloud_limit` (`0` = unlimited, `-1` = local-only / cloud forbidden, `>0` = max daily cloud calls).<br>2. **Core Invariant**: Free Local Tier consumes 0 quota; fallback to paid Cloud Tier checks and increments daily counter before writing headers (D1). Exceeding quota returns `429`, while `-1` returns `503` when local is down (D3).<br>3. Daily counters persist to SQLite table `daily_client_cloud_usage` across restarts (D2) based on local calendar dates (D4). | ✅ Completed |
+| **R2.4** | **Controlled CORS & Chrome PNA Preflight** | 1. Configure `server.allowed_origins` allowlist; empty config permits local origins.<br>2. Handle `OPTIONS` preflight requests (`204 No Content`).<br>3. Support Chrome Private Network Access: respond with `Access-Control-Allow-Private-Network: true` when `Access-Control-Request-Private-Network: true` is present, allowing HTTPS web apps (PatchCat) to reach LAN/localhost EdgeCat instances safely. | ✅ Completed |
+| **R2.5** | **Per-Client SQLite Audit Attribution** | 1. Add `client_name` to `audit_logs` (with idempotent startup schema migration).<br>2. Expose per-client daily cloud calls, limits, remaining quotas and `next_quota_reset` in `GET /health`. | ✅ Completed |
 
 #### Design Constraints to Resolve Before Phase 2
 

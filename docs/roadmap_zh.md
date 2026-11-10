@@ -36,29 +36,18 @@
 
 ---
 
-### 🚧 Phase 2：家庭 / 小团队内网共享与 PatchCat 安全伴侣（下一步核心）
+### ✅ Phase 2：家庭 / 小团队内网共享与 PatchCat 安全伴侣（已完成）
 
 > **目标**：无需引入重型 UI 或多租户计费系统，仅用轻量配置与 SQLite 即可安全支撑“一台 NAS、多台设备/多人共用”与浏览器端 PatchCat 跨域直连。
 
-| 编号 | 需求名称 | 详细工程规约 | 优先级 |
+| 编号 | 需求名称 | 详细工程规约 | 状态 |
 | :--- | :--- | :--- | :---: |
-| **R2.1** | **默认安全与 Fail-Closed 局域网启动门卫** | 1. 默认 `server.host` 收紧为 `"127.0.0.1"`。<br>2. **启动强制自检**：当 `server.host` 配置为非回环地址（如 `"0.0.0.0"` 或局域网 IP）且 `auth.enabled` 未开启（或未配置任何有效客户端 Token）时，启动直接报错退出（除非显式设置 `allow_insecure_lan: true`），杜绝内网无鉴权裸奔。 | **P0** |
-| **R2.2** | **多设备子令牌鉴权 (`auth.clients`)** | 1. 支持在 `edgecat.yaml` 中配置多个客户端条目：`name`（如 `guo-mac`、`family-ipad`、`patchcat-web`）、`token`（`Bearer ec-...`）。<br>2. 校验入站 `Authorization: Bearer <token>`，使用 `subtle.ConstantTimeCompare` 防止时序侧信道；未授权返回 `401 Unauthorized`。<br>3. `/health` 可保持免鉴权只读探活（不暴露敏感配置）。 | **P0** |
-| **R2.3** | **双轨配额控制：本地无限白嫖，云端每日限额 (`daily_cloud_limit`)** | 1. 每个客户端 Token 可配置 `daily_cloud_limit`（每日允许触发云端付费调用的最大次数，`0` 表示不限制，`-1` 表示禁止走云端仅允许走本地）。<br>2. **核心机制**：请求路由至免费 **Local Tier** 时完全不扣减配额；仅当路由或降级至付费 **Cloud Tier** 时，检查并原子递增该客户端当日云端计数（按 UTC/本地自然日自动重置）。<br>3. 超出云端配额时，拒绝发往云端并返回 `429 Too Many Requests`（`{"error": "daily cloud fallback quota exceeded for client"}`）。 | **P0** |
-| **R2.4** | **受控 CORS 与 Chrome PNA 局域网预检** | 1. 配置项 `server.allowed_origins`（支持精确域名白名单，如 `https://patchcat.dev`、`http://localhost:5173`，严禁在启用鉴权时无脑反射任意 `*`）。<br>2. 完整处理 `OPTIONS` 预检请求（返回 `204 No Content`）。<br>3. 支持 Chrome Private Network Access 规范：当收到 `Access-Control-Request-Private-Network: true` 时，响应头注入 `Access-Control-Allow-Private-Network: true`，确保公网 HTTPS 部署的 PatchCat 前端可安全访问用户本机或局域网 NAS 上的 EdgeCat。 | **P1** |
-| **R2.5** | **按设备/成员维度的 SQLite 分账审计** | 1. `audit_logs` 表新增 `client_name TEXT NOT NULL DEFAULT 'anonymous'` 列（支持已有数据库启动时自动 `ALTER TABLE` 幂等迁移）。<br>2. 在 `/health` 端点中增加 `clients_usage` 汇总视图，实时展示各设备的今日请求数與剩余云端降级配额。 | **P1** |
-
-#### Phase 2 实施前待定的设计约束 (Design Constraints to Resolve First)
-
-> 以下 5 条由 **DeepSeek 交叉审阅**（2026-10-22）提出，尚未并入上表验收标准。开工前需先逐条定论，否则会在实现阶段返工。
-
-| # | 待定问题 | 建议结论 | 影响需求 |
-| :--- | :--- | :--- | :--- |
-| **D1** | **配额判定时机**：流式请求的降级发生在 `tryLocalStream` 失败之后、SSE Header 写出之前。若配额在 Header 之后才判定，`429` 已经无法回传 | 配额检查必须插在「本地失败 → 调用云端」之间且早于 `WriteHeader`，这是唯一的拒绝窗口 | R2.3 |
-| **D2** | **配额计数持久化**：纯内存原子计数在进程重启后归零，而 NAS 会重启，等于当日配额可被重启绕过 | 每日计数落 SQLite（每客户端每日一行），启动时加载；内存仅作热路径缓存 | R2.3 / R2.5 |
-| **D3** | **`daily_cloud_limit: -1` 的失败语义**：本地不可用且该客户端被禁止走云端时，应返回什么 | 返回 `503 Service Unavailable` 并给出明确文案（本地不可用且该客户端禁止云端降级），而非笼统的 `429` | R2.3 |
-| **D4** | **配额自然日时区**：按 UTC 还是服务端本地时区重置 | 采用服务端本地时区（家庭场景用户预期为本地日），并在 `/health` 暴露下次重置时间点 | R2.3 |
-| **D5** | **`/v1/models` 仍为硬编码**：当前固定返回三个模型名，多设备共享时客户端（Cherry Studio 等）无法发现配置中的逻辑模型，物理模型名反而被暴露 | 改为从 `local.model_mapping` / `cloud.model_mapping` 的键派生逻辑模型列表，物理名不出现在发现接口 | Phase 2 前置（多端可用性） |
+| **D5** | **模型动态发现与物理名防泄漏** | 动态从 `local.model_mapping` 和 `cloud.model_mapping` 派生 `/v1/models` 逻辑列表，物理模型名（如 `qwen2.5:7b`）绝不泄露给客户端。 | ✅ 已完成 |
+| **R2.1** | **默认安全与 Fail-Closed 局域网启动门卫** | 1. 默认 `server.host` 收紧为 `"127.0.0.1"`。<br>2. **启动强制自检**：当 `server.host` 配置为非回环地址（如 `"0.0.0.0"` 或局域网 IP）且 `auth.enabled` 未开启（或未配置有效 Token）时，启动直接报错退出（除非显式设置 `allow_insecure_lan: true`），杜绝内网无鉴权裸奔。 | ✅ 已完成 |
+| **R2.2** | **多设备子令牌鉴权 (`auth.clients`)** | 1. 支持在配置中维护多客户端条目：`name`（如 `macbook`、`family-pad`）、`token`（`Bearer ...`）。<br>2. 校验入站 `Authorization: Bearer <token>`（采用 `subtle.ConstantTimeCompare` 防时序侧信道）；未授权返回 `401 Unauthorized`。<br>3. `/health` 保持免鉴权只读探活。 | ✅ 已完成 |
+| **R2.3** | **双轨配额控制：本地无限白嫖，云端每日限额 (`daily_cloud_limit`)** | 1. 支持每客户端 `daily_cloud_limit`（`0`: 无限，`-1`: 仅本地/禁止云端降级，`>0`: 每日云端上限）。<br>2. **核心机制**：走本地免费算力完全不消耗配额；仅当降级到云端时，在写 Header 前的决策窗口判定并原子自增（D1 约束）。超出配额返回 `429`，`-1` 本地不可用时返回 `503`（D3 约束）。<br>3. 计数按本地时区自然日（D4）在 SQLite `daily_client_cloud_usage` 表持久化，防重启清零（D2 约束）。 | ✅ 已完成 |
+| **R2.4** | **受控 CORS 与 Chrome PNA 局域网预检** | 1. 配置项 `server.allowed_origins` 精确白名单过滤，空配置放行所有本地请求。<br>2. 完整处理 `OPTIONS` 预检请求（返回 `204 No Content`）。<br>3. 支持 Chrome Private Network Access 规范：预检响应注入 `Access-Control-Allow-Private-Network: true`，确保公网 HTTPS 部署的 PatchCat 前端可安全访问用户本地/NAS EdgeCat。 | ✅ 已完成 |
+| **R2.5** | **按设备/成员维度的 SQLite 分账审计** | 1. `audit_logs` 表新增 `client_name` 字段，支持老数据库启动时自动幂等迁移。<br>2. `/health` 暴露 `clients_usage` 汇总（各客户端今日云端调用量、限额与剩余数）和 `next_quota_reset`。 | ✅ 已完成 |
 
 ---
 

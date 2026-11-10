@@ -1,20 +1,36 @@
 # EdgeCat - Local-First AI Inference Governance Gateway
 # Copyright (c) 2026 Guo Qiang. Distributed under Apache-2.0.
-#
-# SECURITY NOTICE
-# The default host below binds every interface, and EdgeCat currently has no
-# inbound authentication (sub-token auth is planned for Phase 2 / R2.1-R2.2).
-# Run it on a trusted LAN only. Never expose this port to the public internet
-# without a TLS-terminating reverse proxy and an authentication layer in front.
 
 server:
-  host: "0.0.0.0"
+  # Default is strictly loopback (127.0.0.1).
+  # If changing to 0.0.0.0 or LAN IP, auth.enabled must be true with at least one client,
+  # or server.allow_insecure_lan must be set to true (Fail-Closed LAN Guard / R2.1).
+  host: "127.0.0.1"
   port: 8080
   read_timeout_ms: 30000
   write_timeout_ms: 120000
   # SSE only: streams are bounded by idle time rather than total duration, so a
   # slow local model can keep streaming past write_timeout_ms.
   stream_idle_timeout_ms: 300000
+  # Allowed CORS origins for PatchCat or Web UIs. Leave empty to allow all local origins.
+  allowed_origins:
+    - "https://patchcat.dev"
+    - "http://localhost:5173"
+  # Bypass Fail-Closed guard when binding to 0.0.0.0 without auth (NOT recommended).
+  allow_insecure_lan: false
+
+auth:
+  # Multi-device / homelab client authentication (R2.2)
+  enabled: false
+  clients:
+    - name: "macbook-workstation"
+      token: "ec-dev-token-abc"
+      # Daily cloud fallback limits (R2.3):
+      # 0: unlimited, -1: local only (no cloud fallback allowed), >0: max daily cloud calls
+      daily_cloud_limit: 500
+    - name: "family-tablet"
+      token: "ec-pad-token-xyz"
+      daily_cloud_limit: 50
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"

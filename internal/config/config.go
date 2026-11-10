@@ -18,6 +18,7 @@ import (
 // Config represents the complete gateway runtime configuration.
 type Config struct {
 	Server   ServerConfig   `yaml:"server" json:"server"`
+	Auth     AuthConfig     `yaml:"auth" json:"auth"`
 	Local    LocalConfig    `yaml:"local" json:"local"`
 	Cloud    CloudConfig    `yaml:"cloud" json:"cloud"`
 	Filter   FilterConfig   `yaml:"filter" json:"filter"`
@@ -34,7 +35,22 @@ type ServerConfig struct {
 	// StreamIdleTimeoutMs replaces WriteTimeoutMs on SSE responses. A stream is
 	// bounded by how long it stays silent, not by its total duration, so a slow
 	// local model can stream for as long as it keeps producing tokens.
-	StreamIdleTimeoutMs int `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
+	StreamIdleTimeoutMs int      `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
+	AllowedOrigins      []string `yaml:"allowed_origins" json:"allowed_origins"`
+	AllowInsecureLAN    bool     `yaml:"allow_insecure_lan" json:"allow_insecure_lan"`
+}
+
+// AuthConfig configures client authentication for multi-device / homelab sharing.
+type AuthConfig struct {
+	Enabled bool           `yaml:"enabled" json:"enabled"`
+	Clients []ClientConfig `yaml:"clients" json:"clients"`
+}
+
+// ClientConfig represents an authenticated client (device, user, or companion app).
+type ClientConfig struct {
+	Name            string `yaml:"name" json:"name"`
+	Token           string `yaml:"token" json:"token"`
+	DailyCloudLimit int    `yaml:"daily_cloud_limit" json:"daily_cloud_limit"` // 0: unlimited, -1: local only, >0: max daily cloud calls
 }
 
 // LocalConfig configures the local inference tier (e.g., Ollama / vLLM / llama.cpp).
@@ -82,11 +98,17 @@ type AuditConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Host:                "0.0.0.0",
+			Host:                "127.0.0.1",
 			Port:                8080,
 			ReadTimeoutMs:       30000,
 			WriteTimeoutMs:      120000,
 			StreamIdleTimeoutMs: 300000,
+			AllowedOrigins:      []string{},
+			AllowInsecureLAN:    false,
+		},
+		Auth: AuthConfig{
+			Enabled: false,
+			Clients: []ClientConfig{},
 		},
 		Local: LocalConfig{
 			Endpoint:           "http://127.0.0.1:11434/v1",
@@ -151,7 +173,46 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	applySanityChecks(cfg)
+	if err := Validate(cfg); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 	return cfg, nil
+}
+
+// IsLoopbackHost checks whether a host is a local loopback interface.
+func IsLoopbackHost(host string) bool {
+	h := strings.TrimSpace(strings.ToLower(host))
+	return h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+// Validate checks configuration invariants, including the fail-closed LAN guard (R2.1).
+func Validate(cfg *Config) error {
+	// Fail-closed LAN guard: Non-loopback host must have auth enabled with at least one client,
+	// unless explicitly bypassed via AllowInsecureLAN.
+	if !IsLoopbackHost(cfg.Server.Host) && !cfg.Server.AllowInsecureLAN {
+		if !cfg.Auth.Enabled {
+			return fmt.Errorf("fail-closed LAN guard: binding to non-loopback host %q requires auth.enabled=true with at least one client (or set server.allow_insecure_lan=true to bypass)", cfg.Server.Host)
+		}
+		validClients := 0
+		for _, c := range cfg.Auth.Clients {
+			if strings.TrimSpace(c.Token) != "" {
+				validClients++
+			}
+		}
+		if validClients == 0 {
+			return fmt.Errorf("fail-closed LAN guard: binding to non-loopback host %q requires at least one client with a non-empty token in auth.clients", cfg.Server.Host)
+		}
+	}
+
+	if cfg.Auth.Enabled {
+		for i, c := range cfg.Auth.Clients {
+			if strings.TrimSpace(c.Token) == "" {
+				return fmt.Errorf("auth.clients[%d] token cannot be empty when auth is enabled", i)
+			}
+		}
+	}
+
+	return nil
 }
 
 func applySanityChecks(cfg *Config) {

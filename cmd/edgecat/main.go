@@ -21,6 +21,7 @@ import (
 	"github.com/patchcat-dev/edgecat/internal/contract"
 	"github.com/patchcat-dev/edgecat/internal/filter"
 	"github.com/patchcat-dev/edgecat/internal/proxy"
+	"github.com/patchcat-dev/edgecat/internal/quota"
 	"github.com/patchcat-dev/edgecat/internal/router"
 )
 
@@ -89,8 +90,14 @@ func main() {
 		cfg.Contract.RepairTimeoutMs,
 	)
 
-	// 6. Initialize Proxy Handler
-	handler := proxy.NewHandler(cfg, masker, r, guard, auditLogger)
+	// 6. Initialize Quota Manager (for daily cloud limits & multi-device attribution)
+	quotaMgr, err := quota.NewManager(auditLogger.DB(), cfg.Auth.Clients)
+	if err != nil {
+		log.Fatalf("[Init] Failed to initialize quota manager: %v", err)
+	}
+
+	// 7. Initialize Proxy Handler
+	handler := proxy.NewHandler(cfg, masker, r, guard, auditLogger, quotaMgr)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)

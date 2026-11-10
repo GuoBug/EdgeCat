@@ -21,6 +21,7 @@ import (
 // Record represents a single governance audit entry.
 type Record struct {
 	RequestID        string
+	ClientName       string // Name of the authenticated client / device
 	RouteTarget      string // "local" or "cloud"
 	Model            string
 	LatencyMs        int64
@@ -94,6 +95,7 @@ func initSchema(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS audit_logs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		request_id TEXT NOT NULL,
+		client_name TEXT NOT NULL DEFAULT 'anonymous',
 		route_target TEXT NOT NULL,
 		model TEXT NOT NULL,
 		latency_ms INTEGER NOT NULL,
@@ -104,9 +106,24 @@ func initSchema(db *sql.DB) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 	CREATE INDEX IF NOT EXISTS idx_audit_logs_request_id ON audit_logs(request_id);
+	CREATE INDEX IF NOT EXISTS idx_audit_logs_client_name ON audit_logs(client_name);
+
+	-- Table for persistent daily cloud usage counters (D2: survives restarts)
+	CREATE TABLE IF NOT EXISTS daily_client_cloud_usage (
+		client_name TEXT NOT NULL,
+		usage_date TEXT NOT NULL, -- Format YYYY-MM-DD
+		cloud_calls INTEGER NOT NULL DEFAULT 0,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (client_name, usage_date)
+	);
 	`
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Idempotent migration for existing audit_logs table lacking client_name column
+	_, _ = db.Exec(`ALTER TABLE audit_logs ADD COLUMN client_name TEXT NOT NULL DEFAULT 'anonymous';`)
+	return nil
 }
 
 // Log enqueues an audit record without blocking the calling HTTP goroutine.
@@ -192,8 +209,8 @@ func (l *Logger) writeBatch(batch []*Record) error {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO audit_logs (
-			request_id, route_target, model, latency_ms, ttft_ms, pii_redacted_count, status, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			request_id, client_name, route_target, model, latency_ms, ttft_ms, pii_redacted_count, status, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare insert statement: %w", err)
@@ -201,8 +218,13 @@ func (l *Logger) writeBatch(batch []*Record) error {
 	defer stmt.Close()
 
 	for _, r := range batch {
+		clientName := r.ClientName
+		if clientName == "" {
+			clientName = "anonymous"
+		}
 		_, err := stmt.Exec(
 			r.RequestID,
+			clientName,
 			r.RouteTarget,
 			r.Model,
 			r.LatencyMs,
@@ -227,4 +249,9 @@ func (l *Logger) Close() error {
 	close(l.records)
 	l.wg.Wait()
 	return l.db.Close()
+}
+
+// DB returns the underlying database handle for quota and health queries.
+func (l *Logger) DB() *sql.DB {
+	return l.db
 }
