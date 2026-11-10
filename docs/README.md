@@ -7,6 +7,8 @@ Welcome to the internal engineering documentation of EdgeCat. This repository fo
 ```
 docs/
 ├── README.md                                          # Documentation index (this file)
+├── testing_guide.md                                   # Local testing & verification manual (EN)
+├── testing_guide_zh.md                                # 本地测试与验证指南 (ZH)
 ├── roadmap.md                                         # Product positioning & phased requirements backlog (EN)
 ├── roadmap_zh.md                                      # 项目需求池与演进路线图 (ZH)
 └── adr/                                               # Architecture Decision Records (ADR)
