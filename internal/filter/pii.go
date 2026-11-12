@@ -36,8 +36,8 @@ var (
 	// Placeholder regex for rehydration replacement: {{EC_PII_<TYPE>_<INDEX>}}
 	rePlaceholder = regexp.MustCompile(`\{\{EC_PII_[A-Z0-9]+_\d+\}\}`)
 
-	// Chinese mobile numbers (+86 or 11 digits starting with 13-19)
-	rePhone = regexp.MustCompile(`(?:\+?86)?\b1[3-9]\d{9}\b`)
+	// Chinese mobile numbers (optional +86/86 prefix, optional space/hyphen separators)
+	rePhone = regexp.MustCompile(`(?:(?:\+86|86)[- ]?|\b)1[3-9]\d[- ]?\d{4}[- ]?\d{4}\b`)
 
 	// Standard email pattern
 	reEmail = regexp.MustCompile(`\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b`)

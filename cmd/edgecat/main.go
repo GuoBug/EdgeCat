@@ -113,7 +113,7 @@ func main() {
 	// 7. Start HTTP Server
 	go func() {
 		log.Printf("[Server] EdgeCat listening on http://%s", addr)
-		log.Printf("[Server] Ingress endpoints: /v1/chat/completions, /health, /v1/models")
+		log.Printf("[Server] Ingress endpoints: /v1/chat/completions, /health, /admin/status, /v1/models")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[Server] HTTP server encountered fatal error: %v", err)
 		}

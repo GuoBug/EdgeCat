@@ -38,6 +38,7 @@ type ServerConfig struct {
 	StreamIdleTimeoutMs int      `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
 	AllowedOrigins      []string `yaml:"allowed_origins" json:"allowed_origins"`
 	AllowInsecureLAN    bool     `yaml:"allow_insecure_lan" json:"allow_insecure_lan"`
+	MaxRequestBodyBytes int64    `yaml:"max_request_body_bytes" json:"max_request_body_bytes"`
 }
 
 // AuthConfig configures client authentication for multi-device / homelab sharing.
@@ -105,6 +106,7 @@ func DefaultConfig() *Config {
 			StreamIdleTimeoutMs: 300000,
 			AllowedOrigins:      []string{},
 			AllowInsecureLAN:    false,
+			MaxRequestBodyBytes: 10 * 1024 * 1024, // 10MB default limit
 		},
 		Auth: AuthConfig{
 			Enabled: false,
@@ -224,6 +226,9 @@ func applySanityChecks(cfg *Config) {
 	}
 	if cfg.Server.StreamIdleTimeoutMs <= 0 {
 		cfg.Server.StreamIdleTimeoutMs = 300000
+	}
+	if cfg.Server.MaxRequestBodyBytes <= 0 {
+		cfg.Server.MaxRequestBodyBytes = 10 * 1024 * 1024
 	}
 	if cfg.Local.TTFTTimeoutMs <= 0 {
 		cfg.Local.TTFTTimeoutMs = 3500

@@ -173,3 +173,34 @@ func TestSlidingRehydrator_NonPlaceholderBraces(t *testing.T) {
 		t.Fatalf("expected %q, got %q", expected, total)
 	}
 }
+
+func TestMasker_PhoneFormats(t *testing.T) {
+	masker := filter.NewMasker(true, false, false, false)
+
+	testCases := []string{
+		"13800138000",
+		"+8613800138000",
+		"+86 13800138000",
+		"+86-138-0013-8000",
+		"138 0013 8000",
+		"138-0013-8000",
+		"86 13800138000",
+	}
+
+	for _, tc := range testCases {
+		vault := filter.NewVault()
+		input := "Please call me at " + tc + " right now."
+		masked := masker.MaskText(input, vault)
+
+		if strings.Contains(masked, tc) {
+			t.Fatalf("failed to mask phone number %q in %q", tc, masked)
+		}
+		if !strings.Contains(masked, "{{EC_PII_PHONE_1}}") {
+			t.Fatalf("expected placeholder {{EC_PII_PHONE_1}} for %q, got %q", tc, masked)
+		}
+		rehydrated := vault.Rehydrate(masked)
+		if rehydrated != input {
+			t.Fatalf("rehydrate mismatch for %q: got %q, want %q", tc, rehydrated, input)
+		}
+	}
+}

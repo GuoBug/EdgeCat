@@ -6,6 +6,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -96,6 +97,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case (r.URL.Path == "/admin/status" || r.URL.Path == "/v1/admin/status") && r.Method == http.MethodGet:
+		h.handleAdminStatus(w, r)
 	case r.URL.Path == "/v1/models" && r.Method == http.MethodGet:
 		h.handleModels(w, r)
 	case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
@@ -107,38 +110,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleCORS sets CORS headers and handles OPTIONS preflights including Chrome PNA.
 // It returns true if the request was an OPTIONS preflight and has been fully served.
+// By default (empty AllowedOrigins), cross-origin requests are denied (secure fail-closed).
 func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	origin := r.Header.Get("Origin")
-	if origin != "" {
-		allowed := false
-		if len(h.cfg.Server.AllowedOrigins) == 0 {
-			// If no allowlist is configured, permit all origins (standard for local sidecars)
-			allowed = true
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-		} else {
-			for _, o := range h.cfg.Server.AllowedOrigins {
-				if o == "*" || strings.EqualFold(o, origin) {
-					allowed = true
-					w.Header().Set("Access-Control-Allow-Origin", origin)
-					break
-				}
-			}
+	if origin == "" {
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return true
 		}
+		return false
+	}
 
-		if allowed {
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EdgeCat-Strict-JSON, Access-Control-Request-Private-Network")
-			w.Header().Set("Access-Control-Expose-Headers", "X-EdgeCat-Route, Content-Length")
-			w.Header().Set("Access-Control-Max-Age", "86400")
+	allowed := false
+	for _, o := range h.cfg.Server.AllowedOrigins {
+		if o == "*" || strings.EqualFold(o, origin) {
+			allowed = true
+			break
+		}
+	}
 
-			// Chrome Private Network Access (PNA) preflight support
-			if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
-				w.Header().Set("Access-Control-Allow-Private-Network", "true")
-			}
+	if allowed {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EdgeCat-Strict-JSON, Access-Control-Request-Private-Network")
+		w.Header().Set("Access-Control-Expose-Headers", "X-EdgeCat-Route, Content-Length")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Chrome Private Network Access (PNA) preflight support
+		if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
 		}
 	}
 
 	if r.Method == http.MethodOptions {
+		if !allowed {
+			http.Error(w, "CORS origin not allowed", http.StatusForbidden)
+			return true
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -170,6 +178,18 @@ func (h *Handler) authenticate(r *http.Request) (*config.ClientConfig, bool) {
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// Public minimal liveness check. Does not expose internal endpoints, client identities, or quotas.
+	resp := map[string]any{
+		"status": "healthy",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	// Detailed operational status for authenticated administrative inspection.
 	resp := map[string]any{
 		"status": "healthy",
 		"local_tier": map[string]any{
@@ -248,8 +268,27 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	startTime := time.Now()
 	requestID := generateRequestID()
 
+	maxBytes := h.cfg.Server.MaxRequestBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = 10 * 1024 * 1024
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{
+					"message": fmt.Sprintf("request body exceeds limit of %d bytes", maxBytes),
+					"type":    "invalid_request_error",
+					"code":    "payload_too_large",
+				},
+			})
+			return
+		}
 		http.Error(w, `{"error": "failed to read request body"}`, http.StatusBadRequest)
 		return
 	}
@@ -406,46 +445,75 @@ func (h *Handler) handleStreaming(
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	rehydrator := filter.NewSlidingRehydrator(vault)
+	streamRehydrator := NewStreamRehydrator(vault)
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), upstreamResp.Body))
 
-	// Process first chunk if already read during TTFT watcher
-	if len(firstChunk) > 0 {
-		out := rehydrator.Feed(string(firstChunk))
-		if len(out) > 0 {
-			touchDeadline()
-			_, _ = w.Write([]byte(out))
-			flusher.Flush()
+	writeEvent := func(lines []string) {
+		if len(lines) == 0 {
+			return
 		}
+		touchDeadline()
+		for _, l := range lines {
+			_, _ = w.Write([]byte(l))
+			_, _ = w.Write([]byte("\n"))
+		}
+		_, _ = w.Write([]byte("\n"))
+		flusher.Flush()
 	}
 
-	// Stream remainder
-	buf := make([]byte, 4096)
+	var eventLines []string
 	for {
-		n, readErr := upstreamResp.Body.Read(buf)
-		if n > 0 {
+		lineBytes, readErr := reader.ReadBytes('\n')
+		if len(lineBytes) > 0 {
 			if ttftMs == 0 {
 				ttftMs = time.Since(startTime).Milliseconds()
 			}
-			out := rehydrator.Feed(string(buf[:n]))
-			if len(out) > 0 {
-				touchDeadline()
-				_, _ = w.Write([]byte(out))
-				flusher.Flush()
+			line := strings.TrimRight(string(lineBytes), "\r\n")
+
+			if line == "" {
+				// Empty line signals end of SSE event
+				if len(eventLines) > 0 {
+					writeEvent(eventLines)
+					eventLines = nil
+				}
+			} else if strings.HasPrefix(line, "data:") {
+				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if payload == "[DONE]" {
+					// Stream completion: flush any buffered pending prefixes before [DONE]
+					tailEvents := streamRehydrator.FlushPendingChunks()
+					for _, tailEvent := range tailEvents {
+						writeEvent([]string{tailEvent})
+					}
+					eventLines = append(eventLines, "data: [DONE]")
+					writeEvent(eventLines)
+					eventLines = nil
+				} else if strings.HasPrefix(payload, "{") {
+					processedLine := streamRehydrator.ProcessJSONLine(line, payload)
+					eventLines = append(eventLines, processedLine)
+				} else {
+					eventLines = append(eventLines, line)
+				}
+			} else {
+				// Comments or other event headers (event:, id:, : ...)
+				eventLines = append(eventLines, line)
 			}
 		}
+
 		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
 			break
 		}
 	}
 
-	// Flush any pending tail in rehydrator buffer
-	if tail := rehydrator.Flush(); len(tail) > 0 {
-		touchDeadline()
-		_, _ = w.Write([]byte(tail))
-		flusher.Flush()
+	// Flush any leftover lines
+	if len(eventLines) > 0 {
+		writeEvent(eventLines)
+		eventLines = nil
+	}
+
+	// Flush any remaining tail in rehydrators if stream closed without [DONE]
+	tailEvents := streamRehydrator.FlushPendingChunks()
+	for _, tailEvent := range tailEvents {
+		writeEvent([]string{tailEvent})
 	}
 
 	// Log audit record asynchronously

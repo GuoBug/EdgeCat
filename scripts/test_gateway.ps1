@@ -12,8 +12,11 @@ Write-Host "`n[1/4] Testing Health Endpoint ($baseUrl/health)..." -ForegroundCol
 try {
     $health = Invoke-RestMethod -Uri "$baseUrl/health" -Method Get
     Write-Host "Status: $($health.status)" -ForegroundColor Green
-    Write-Host "Local Tier Configured: $($health.local_tier.configured) (Active: $($health.local_tier.active_concurrency)/$($health.local_tier.max_concurrency))"
-    Write-Host "Audit Logs Written: $($health.audit.written_total)"
+
+    # Query /admin/status for tier configuration & audit throughput
+    $adminStatus = Invoke-RestMethod -Uri "$baseUrl/admin/status" -Method Get
+    Write-Host "Local Tier Configured: $($adminStatus.local_tier.configured) (Active: $($adminStatus.local_tier.active_concurrency)/$($adminStatus.local_tier.max_concurrency))"
+    Write-Host "Audit Logs Written: $($adminStatus.audit.written_total)"
 } catch {
     Write-Host "Failed to connect to EdgeCat at $baseUrl. Make sure EdgeCat is running!" -ForegroundColor Red
     exit 1
@@ -83,9 +86,9 @@ try {
 Write-Host "`n[4/4] Verifying SQLite Audit DB..." -ForegroundColor Yellow
 Start-Sleep -Seconds 2 # Wait for async batch worker flush
 try {
-    $healthAfter = Invoke-RestMethod -Uri "$baseUrl/health" -Method Get
-    Write-Host "Total Audit Records in DB: $($healthAfter.audit.written_total)" -ForegroundColor Green
-    Write-Host "Dropped Records: $($healthAfter.audit.dropped_total)"
+    $adminAfter = Invoke-RestMethod -Uri "$baseUrl/admin/status" -Method Get
+    Write-Host "Total Audit Records in DB: $($adminAfter.audit.written_total)" -ForegroundColor Green
+    Write-Host "Dropped Records: $($adminAfter.audit.dropped_total)"
 } catch {
     Write-Host "Audit check failed: $_" -ForegroundColor Red
 }
