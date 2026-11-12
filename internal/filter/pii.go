@@ -303,11 +303,17 @@ func (r *SlidingRehydrator) findUnclosedPrefixCut(s string) int {
 
 // isValidPlaceholderCandidate checks if s starts with "{{EC_" and contains only valid
 // placeholder characters [A-Za-z0-9_] without closing "}}".
+// It allows at most one trailing '}' to support cases where "}}" is split across chunks.
 func isValidPlaceholderCandidate(s string) bool {
 	if !strings.HasPrefix(s, "{{EC_") {
 		return false
 	}
 	body := s[len("{{EC_"):]
+	// Allow at most one trailing '}' in case the closing "}}" is split across chunks
+	body = strings.TrimSuffix(body, PlaceholderSuffix[:1])
+	if strings.Contains(body, "}") {
+		return false
+	}
 	for _, ch := range body {
 		if !((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_') {
 			return false

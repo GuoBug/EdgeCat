@@ -8,11 +8,13 @@ package proxy_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/patchcat-dev/edgecat/internal/config"
 	"github.com/patchcat-dev/edgecat/internal/filter"
@@ -320,5 +322,287 @@ func TestProxy_RequestBodyLimit(t *testing.T) {
 	errObj, ok := errResp["error"].(map[string]any)
 	if !ok || errObj["code"] != "payload_too_large" {
 		t.Fatalf("expected error code payload_too_large, got %v", errResp)
+	}
+}
+
+// TestProxy_Streaming_PII_SplitBetweenClosingBraces reproduces and verifies the fix
+// for placeholders split right between the two closing braces ('{{EC_PII_PHONE_1}' and '} now').
+func TestProxy_Streaming_PII_SplitBetweenClosingBraces(t *testing.T) {
+	const phone = "13800138000"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+
+		// Frame 1: ends with single closing brace
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-b1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Phone: {{EC_PII_PHONE_1}\"},\"finish_reason\":null}]}\n\n"))
+		flusher.Flush()
+
+		// Frame 2: starts with second closing brace
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-b1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"} is verified.\"},\"finish_reason\":null}]}\n\n"))
+		flusher.Flush()
+
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	cfg.Cloud.Endpoint = upstream.URL
+
+	h := newTestHandler(t, cfg)
+
+	reqBody := `{"model":"default","stream":true,"messages":[{"role":"user","content":"Call 13800138000"}]}`
+	rec := postChatCompletion(t, h, reqBody, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	clientResp := rec.Body.String()
+	if !strings.Contains(clientResp, phone) {
+		t.Fatalf("phone not restored when closing braces split across frames!\nResponse:\n%s", clientResp)
+	}
+	if strings.Contains(clientResp, "{{EC_PII_") {
+		t.Fatalf("placeholder leaked in response:\n%s", clientResp)
+	}
+}
+
+// TestProxy_CORS_DisallowedOrigin_POST_BlockedWith403 verifies that cross-origin POST requests
+// with unauthorized Origin headers are rejected with 403 Forbidden without reaching inference.
+func TestProxy_CORS_DisallowedOrigin_POST_BlockedWith403(t *testing.T) {
+	cfg := config.DefaultConfig()
+	// AllowedOrigins is empty by default
+	h := newTestHandler(t, cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://unauthorized-origin.com")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed POST Origin, got %d", rec.Code)
+	}
+}
+
+// TestProxy_ChatCompletions_EnforceApplicationJSON verifies that non-JSON Content-Type
+// is rejected with HTTP 415 Unsupported Media Type.
+func TestProxy_ChatCompletions_EnforceApplicationJSON(t *testing.T) {
+	h := newTestHandler(t, config.DefaultConfig())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"default","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "text/plain") // non-JSON
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 Unsupported Media Type for text/plain, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Step 3 Acceptance 1: Local generates tokens over long duration without timing out, returning 200 OK via Local.
+func TestProxy_Step3_Acceptance_LocalLongStreamSuccess(t *testing.T) {
+	chunkCount := 5
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+
+		// 1. Initial TTFT token fast
+		time.Sleep(10 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-local\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Chunk 0\"},\"finish_reason\":null}]}\n\n"))
+		flusher.Flush()
+
+		// 2. Output chunks sequentially
+		for i := 1; i <= chunkCount; i++ {
+			time.Sleep(20 * time.Millisecond)
+			_, _ = w.Write([]byte(fmt.Sprintf("data: {\"id\":\"chatcmpl-local\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" Chunk %d\"},\"finish_reason\":null}]}\n\n", i)))
+			flusher.Flush()
+		}
+
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-local\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	cfg.Local.TTFTTimeoutMs = 100 // 100ms TTFT
+	cfg.Local.StreamIdleTimeoutMs = 200 // 200ms idle timeout
+
+	h := newTestHandler(t, cfg)
+
+	// Non-streaming call should aggregate all chunks and return 200 via local
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"Generate"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-EdgeCat-Route") != "local" {
+		t.Fatalf("expected route local, got %s", rec.Header().Get("X-EdgeCat-Route"))
+	}
+	if !strings.Contains(rec.Body.String(), "Chunk 5") {
+		t.Fatalf("expected aggregated content to contain final chunk, got: %s", rec.Body.String())
+	}
+}
+
+// Step 3 Acceptance 2: Local TTFT timeout triggers clean fallback to Cloud.
+func TestProxy_Step3_Acceptance_LocalTTFTTimeout_FallbacksToCloud(t *testing.T) {
+	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond) // exceeds 50ms TTFT
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"too late\"}}]}\n\n"))
+	}))
+	defer localServer.Close()
+
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-cloud","choices":[{"index":0,"message":{"role":"assistant","content":"from cloud"},"finish_reason":"stop"}]}`))
+	}))
+	defer cloudServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = localServer.URL
+	cfg.Local.TTFTTimeoutMs = 50 // 50ms TTFT
+	cfg.Cloud.Endpoint = cloudServer.URL
+
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-EdgeCat-Route") != "cloud" {
+		t.Fatalf("expected fallback to cloud, got: %s", rec.Header().Get("X-EdgeCat-Route"))
+	}
+	if !strings.Contains(rec.Body.String(), "from cloud") {
+		t.Fatalf("expected cloud response, got: %s", rec.Body.String())
+	}
+}
+
+// Step 3 Acceptance 3: Local produces first token, then stalls > stream_idle_timeout_ms.
+// Concurrency slot must be released, returns 504 upstream_idle_timeout, and DOES NOT fallback to cloud.
+func TestProxy_Step3_Acceptance_LocalIdleTimeout_ReleasesConcurrency_NoCloudFallback(t *testing.T) {
+	cloudCalled := false
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cloudCalled = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"message":{"content":"cloud should not be called"}}]}`))
+	}))
+	defer cloudServer.Close()
+
+	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+
+		// First token arrives fast (within TTFT)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Start\"}}]}\n\n"))
+		flusher.Flush()
+
+		// Stalls for longer than stream idle timeout (60ms)
+		time.Sleep(150 * time.Millisecond)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"After Stall\"}}]}\n\n"))
+		flusher.Flush()
+	}))
+	defer localServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = localServer.URL
+	cfg.Local.TTFTTimeoutMs = 100
+	cfg.Local.StreamIdleTimeoutMs = 50 // 50ms stream idle timeout
+	cfg.Cloud.Endpoint = cloudServer.URL
+
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"stall test"}]}`, nil)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("expected 504 Gateway Timeout for stalled stream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_idle_timeout") {
+		t.Fatalf("expected error code upstream_idle_timeout, got: %s", rec.Body.String())
+	}
+	if cloudCalled {
+		t.Fatalf("CRITICAL: cloud fallback must NEVER be triggered after local has already started generating tokens!")
+	}
+}
+
+// Step 3 Acceptance 4: Cloud tier times out before returning headers -> returns 502 Bad Gateway.
+func TestProxy_Step3_Acceptance_CloudHeaderTimeout_Returns502(t *testing.T) {
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond) // stalls longer than cloud timeout (40ms)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloudServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = "" // no local tier, direct cloud
+	cfg.Cloud.Endpoint = cloudServer.URL
+	cfg.Cloud.TimeoutMs = 40 // 40ms cloud timeout
+
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"cloud timeout"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for cloud header timeout, got %d", rec.Code)
+	}
+}
+
+// Step 3 Acceptance 5: Non-streaming + Strict JSON + local stream aggregation retains tool_calls completely.
+func TestProxy_Step3_Acceptance_NonStreaming_StrictJSON_ToolCallsPreserved(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+
+		// Chunk 1: tool call definition and argument start
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-tc\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"function\",\"function\":{\"name\":\"query_db\",\"arguments\":\"{\\\"sql\\\": \\\"SELECT \"}}]}}]}\n\n"))
+		flusher.Flush()
+
+		// Chunk 2: tool call argument remainder
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-tc\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"* FROM users\\\"}\"}}]}}]}\n\n"))
+		flusher.Flush()
+
+		// Chunk 3: finish_reason
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-tc\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	cfg.Contract.StrictJSONEnabled = true
+
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"fetch users"}]}`, map[string]string{
+		"X-EdgeCat-Strict-JSON": "true",
+	})
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var respObj map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &respObj); err != nil {
+		t.Fatalf("failed to decode response JSON: %v (%s)", err, rec.Body.String())
+	}
+
+	choices := respObj["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	toolCalls, ok := msg["tool_calls"].([]any)
+	if !ok || len(toolCalls) == 0 {
+		t.Fatalf("expected tool_calls to be preserved, got message: %v", msg)
+	}
+
+	tc := toolCalls[0].(map[string]any)
+	fn := tc["function"].(map[string]any)
+	if fn["name"] != "query_db" {
+		t.Fatalf("expected tool name query_db, got %v", fn["name"])
+	}
+	expectedArgs := `{"sql": "SELECT * FROM users"}`
+	if fn["arguments"] != expectedArgs {
+		t.Fatalf("expected arguments %q, got %q", expectedArgs, fn["arguments"])
 	}
 }

@@ -145,6 +145,69 @@ func (s *StreamRehydrator) rehydrateChunkObject(chunkObj map[string]any) {
 				}
 			}
 		}
+
+		// If this choice signals finish_reason, flush its pending residual content immediately
+		// so clients that stop reading upon receiving finish_reason receive all text without delay.
+		if choice["finish_reason"] != nil {
+			if r, exists := s.contentRehydrators[choiceIdx]; exists {
+				if tail := r.Flush(); tail != "" {
+					if existing, ok := delta["content"].(string); ok {
+						delta["content"] = existing + tail
+					} else {
+						delta["content"] = tail
+					}
+				}
+				delete(s.contentRehydrators, choiceIdx)
+			}
+
+			if r, exists := s.reasoningRehydrators[choiceIdx]; exists {
+				if tail := r.Flush(); tail != "" {
+					if existing, ok := delta["reasoning_content"].(string); ok {
+						delta["reasoning_content"] = existing + tail
+					} else {
+						delta["reasoning_content"] = tail
+					}
+				}
+				delete(s.reasoningRehydrators, choiceIdx)
+			}
+
+			if choiceTools, exists := s.toolCallRehydrators[choiceIdx]; exists {
+				for toolIdx, r := range choiceTools {
+					if tail := r.Flush(); tail != "" {
+						appended := false
+						if toolCalls, ok := delta["tool_calls"].([]any); ok {
+							for _, rawTool := range toolCalls {
+								if tc, ok := rawTool.(map[string]any); ok && parseChoiceIndex(tc["index"]) == toolIdx {
+									if fn, ok := tc["function"].(map[string]any); ok {
+										if existing, ok := fn["arguments"].(string); ok {
+											fn["arguments"] = existing + tail
+										} else {
+											fn["arguments"] = tail
+										}
+										appended = true
+										break
+									}
+								}
+							}
+						}
+						if !appended {
+							newTC := map[string]any{
+								"index": toolIdx,
+								"function": map[string]any{
+									"arguments": tail,
+								},
+							}
+							if tcList, ok := delta["tool_calls"].([]any); ok {
+								delta["tool_calls"] = append(tcList, newTC)
+							} else {
+								delta["tool_calls"] = []any{newTC}
+							}
+						}
+					}
+				}
+				delete(s.toolCallRehydrators, choiceIdx)
+			}
+		}
 	}
 }
 

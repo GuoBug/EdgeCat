@@ -45,6 +45,29 @@ func TestSlidingRehydrator_SplitPlaceholder_ExactRequirement(t *testing.T) {
 	}
 }
 
+func TestSlidingRehydrator_SplitBetweenClosingBraces(t *testing.T) {
+	vault := filter.NewVault()
+	phone := "13812345678"
+	vault.Mask(filter.TypePhone, phone) // {{EC_PII_PHONE_1}}
+
+	rehydrator := filter.NewSlidingRehydrator(vault)
+
+	// Chunk 1 ends with single closing brace '}'
+	c1 := "{{EC_PII_PHONE_1}"
+	o1 := rehydrator.Feed(c1)
+	if o1 != "" {
+		t.Fatalf("expected o1 to be buffered, got %q", o1)
+	}
+
+	// Chunk 2 starts with second closing brace '}'
+	c2 := "} now"
+	o2 := rehydrator.Feed(c2)
+	expectedO2 := phone + " now"
+	if o2 != expectedO2 {
+		t.Fatalf("expected %q, got %q", expectedO2, o2)
+	}
+}
+
 func TestSlidingRehydrator_SplitWithSurroundingText(t *testing.T) {
 	vault := filter.NewVault()
 	phone := "13987654321"

@@ -40,6 +40,7 @@ local:
   api_key: ""
   max_concurrent_local: 2
   ttft_timeout_ms: 3500
+  stream_idle_timeout_ms: 30000 # Idle timeout between chunks during generation (default 30s)
   model_mapping:
     "default": "qwen2.5:7b"
     "gpt-4o-mini": "qwen2.5:7b"

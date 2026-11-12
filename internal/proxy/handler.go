@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/patchcat-dev/edgecat/internal/audit"
@@ -129,24 +130,31 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 		}
 	}
 
-	if allowed {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EdgeCat-Strict-JSON, Access-Control-Request-Private-Network")
-		w.Header().Set("Access-Control-Expose-Headers", "X-EdgeCat-Route, Content-Length")
-		w.Header().Set("Access-Control-Max-Age", "86400")
+	if !allowed {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "CORS origin not allowed",
+				"type":    "invalid_request_error",
+				"code":    "origin_not_allowed",
+			},
+		})
+		return true
+	}
 
-		// Chrome Private Network Access (PNA) preflight support
-		if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
-			w.Header().Set("Access-Control-Allow-Private-Network", "true")
-		}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-EdgeCat-Strict-JSON, Access-Control-Request-Private-Network")
+	w.Header().Set("Access-Control-Expose-Headers", "X-EdgeCat-Route, Content-Length")
+	w.Header().Set("Access-Control-Max-Age", "86400")
+
+	// Chrome Private Network Access (PNA) preflight support
+	if strings.EqualFold(r.Header.Get("Access-Control-Request-Private-Network"), "true") {
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
 	}
 
 	if r.Method == http.MethodOptions {
-		if !allowed {
-			http.Error(w, "CORS origin not allowed", http.StatusForbidden)
-			return true
-		}
 		w.WriteHeader(http.StatusNoContent)
 		return true
 	}
@@ -265,6 +273,22 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, client *config.ClientConfig) {
+	// Enforce Content-Type: application/json (RFC 7231 / OpenAI specification)
+	ct := r.Header.Get("Content-Type")
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
+	if mediaType != "application/json" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "unsupported media type: Content-Type must be application/json",
+				"type":    "invalid_request_error",
+				"code":    "unsupported_media_type",
+			},
+		})
+		return
+	}
+
 	startTime := time.Now()
 	requestID := generateRequestID()
 
@@ -448,6 +472,18 @@ func (h *Handler) handleStreaming(
 	streamRehydrator := NewStreamRehydrator(vault)
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), upstreamResp.Body))
 
+	idleTimeout := h.router.LocalStreamIdleTimeout()
+	if finalTarget == router.TargetCloud {
+		idleTimeout = time.Duration(h.cfg.Server.StreamIdleTimeoutMs) * time.Millisecond
+	}
+
+	var upstreamIdleTimedOut atomic.Bool
+	idleTimer := time.AfterFunc(idleTimeout, func() {
+		upstreamIdleTimedOut.Store(true)
+		_ = upstreamResp.Body.Close()
+	})
+	defer idleTimer.Stop()
+
 	writeEvent := func(lines []string) {
 		if len(lines) == 0 {
 			return
@@ -465,6 +501,7 @@ func (h *Handler) handleStreaming(
 	for {
 		lineBytes, readErr := reader.ReadBytes('\n')
 		if len(lineBytes) > 0 {
+			idleTimer.Reset(idleTimeout)
 			if ttftMs == 0 {
 				ttftMs = time.Since(startTime).Milliseconds()
 			}
@@ -500,6 +537,9 @@ func (h *Handler) handleStreaming(
 		}
 
 		if readErr != nil {
+			if upstreamIdleTimedOut.Load() {
+				log.Printf("[Proxy %s] Upstream stream idle timeout (%v)", reqID, idleTimeout)
+			}
 			break
 		}
 	}
@@ -673,9 +713,16 @@ func (h *Handler) callCloudStream(
 		return nil, err
 	}
 
+	cloudCtx, cancel := context.WithCancel(ctx)
+	headerTimer := time.AfterFunc(h.router.CloudTimeout(), func() {
+		cancel()
+	})
+	defer headerTimer.Stop()
+
 	url := strings.TrimRight(h.router.CloudEndpoint(), "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(cloudCtx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -685,8 +732,11 @@ func (h *Handler) callCloudStream(
 
 	resp, err := h.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, fmt.Errorf("cloud connection failed: %w", err)
 	}
+	headerTimer.Stop()
+
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -712,18 +762,113 @@ func (h *Handler) handleNonStreaming(
 	var finalModel = decision.TargetModel
 	var rawResp []byte
 	var err error
+	var ttftMs int64 = 0
 
-	// If Local was acquired, attempt call with TTFT/timeout
+	// If Local was acquired, stream with TTFT admission check and aggregate.
+	// Even though the client requested a non-streaming response, calling local with
+	// stream:true lets us reuse the strict TTFT cutoff, while allowing healthy long
+	// generations to proceed without timing out arbitrarily.
 	if decision.AcquiredLocal {
-		rawResp, err = h.callLocalNonStreaming(r.Context(), req, decision.TargetModel)
-		if err != nil {
-			log.Printf("[Proxy %s] Local non-streaming fallback: %v. Rerouting to Cloud.", reqID, err)
+		req.fields["stream"] = true
+		localResp, firstChunk, localTTFT, cancelLocal, localErr := h.tryLocalStream(r.Context(), req, decision.TargetModel)
+		req.fields["stream"] = false // restore client non-streaming setting
+
+		if localErr != nil {
+			log.Printf("[Proxy %s] Local non-streaming TTFT fallback: %v. Rerouting to Cloud.", reqID, localErr)
 			h.router.ReleaseLocal()
 			decision.AcquiredLocal = false
 			h.router.RecordFallback()
 
 			finalTarget = router.TargetCloud
 			finalModel = h.router.ResolveModel(router.TargetCloud, req.Model())
+		} else {
+			// First token arrived in time! Local inference is underway.
+			// Read remainder with idle timeout. No cloud fallback from this point forward.
+			ttftMs = localTTFT
+
+			isSSE := strings.Contains(strings.ToLower(localResp.Header.Get("Content-Type")), "text/event-stream") ||
+				bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte("data:")) ||
+				bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte(":"))
+
+			if isSSE {
+				reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), localResp.Body))
+				aggData, aggErr := ReadAndAggregateStream(reader, h.router.LocalStreamIdleTimeout(), cancelLocal, decision.TargetModel)
+				localResp.Body.Close()
+				cancelLocal()
+				h.router.ReleaseLocal()
+				decision.AcquiredLocal = false
+
+				if aggErr != nil {
+					log.Printf("[Proxy %s] Local stream aggregation failed: %v", reqID, aggErr)
+					clientName := "anonymous"
+					if client != nil && client.Name != "" {
+						clientName = client.Name
+					}
+
+					statusCode := http.StatusBadGateway
+					errCode := "local_stream_error"
+					errMsg := fmt.Sprintf("local stream aggregation failed: %v", aggErr)
+					if errors.Is(aggErr, ErrUpstreamIdleTimeout) {
+						statusCode = http.StatusGatewayTimeout
+						errCode = "upstream_idle_timeout"
+						errMsg = "local stream idle timeout"
+					}
+
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(statusCode)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"error": map[string]any{
+							"message": errMsg,
+							"type":    "gateway_error",
+							"code":    errCode,
+						},
+					})
+					h.audit.Log(&audit.Record{
+						RequestID:        reqID,
+						ClientName:       clientName,
+						RouteTarget:      finalTarget,
+						Model:            finalModel,
+						LatencyMs:        time.Since(startTime).Milliseconds(),
+						TTFTMs:           ttftMs,
+						PIIRedactedCount: piiRedacted,
+						Status:           statusCode,
+						CreatedAt:        startTime,
+					})
+					return
+				}
+
+				rawResp = aggData
+			} else {
+				// Local tier returned non-streaming JSON directly
+				remainder, readErr := io.ReadAll(localResp.Body)
+				localResp.Body.Close()
+				cancelLocal()
+				h.router.ReleaseLocal()
+				decision.AcquiredLocal = false
+
+				if readErr != nil {
+					log.Printf("[Proxy %s] Local read failed: %v", reqID, readErr)
+					clientName := "anonymous"
+					if client != nil && client.Name != "" {
+						clientName = client.Name
+					}
+					http.Error(w, fmt.Sprintf(`{"error": "local inference failed: %s"}`, readErr.Error()), http.StatusBadGateway)
+					h.audit.Log(&audit.Record{
+						RequestID:        reqID,
+						ClientName:       clientName,
+						RouteTarget:      finalTarget,
+						Model:            finalModel,
+						LatencyMs:        time.Since(startTime).Milliseconds(),
+						TTFTMs:           ttftMs,
+						PIIRedactedCount: piiRedacted,
+						Status:           http.StatusBadGateway,
+						CreatedAt:        startTime,
+					})
+					return
+				}
+
+				rawResp = append(firstChunk, remainder...)
+			}
 		}
 	}
 
@@ -850,7 +995,7 @@ func (h *Handler) callLocalNonStreaming(
 		return nil, err
 	}
 
-	timeout := h.router.LocalTTFTTimeout() * 3
+	timeout := h.router.LocalStreamIdleTimeout()
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

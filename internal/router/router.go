@@ -152,6 +152,15 @@ func (r *Router) LocalTTFTTimeout() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// LocalStreamIdleTimeout returns the idle timeout between stream chunks for the local tier.
+func (r *Router) LocalStreamIdleTimeout() time.Duration {
+	ms := r.cfg.Local.StreamIdleTimeoutMs
+	if ms <= 0 {
+		ms = 30000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // CloudEndpoint returns the URL of the cloud tier endpoint.
 func (r *Router) CloudEndpoint() string {
 	return r.cfg.Cloud.Endpoint
