@@ -23,7 +23,7 @@
 3. **输出格式失控**：模型常常无视 `response_format` 强行包裹 ````json 代码块，破坏下游反序列化契约；
 4. **同步写日志拖慢推理延迟**：传统网关在 HTTP 协程中同步写入数据库，导致首字耗时（TTFT）劣化。
 
-**EdgeCat 通过以下六大确定性机制彻底化解上述痛点：**
+**EdgeCat 通过以下六大确定性机制应对上述痛点：**
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -68,13 +68,14 @@
 
 ## 六大核心架构支柱
 
-### 1. 滑动窗口流式还原 (Sliding-Window SSE Rehydration)
-- **掩码阶段**：请求进入时，提取手机号、邮箱、内网 IPv4 及各类 API Key，替换为确定性占位符 `{{EC_PII_<TYPE>_<INDEX>}}`（同值去重，保持上下文一致性），原值隔离保存在当前 Context 的 `Vault` 中。
-- **流式拼接**：设计了双游标轻量级滑动窗口缓冲器。当检测到未闭合的占位符前缀（如 `{{EC_` 或 `{{EC_PII_`）时，网关将截断部分暂存至 `pending` 缓冲区，前序安全内容即刻刷出；下一 Chunk 到达拼接闭合后，完成替换再向下游 `http.Flusher` 输出，完美解决 Token 分词跨 Chunk 截断痛点。
+### 1. SSE 帧级滑动窗口流式还原 (Frame-Level SSE Rehydration)
+- **掩码阶段**：请求进入时，提取中国大陆手机号（含 `+86`/`86` 前缀与空格/短横线分隔）、邮箱、内网 IPv4 及各类 API Key，替换为确定性占位符 `{{EC_PII_<TYPE>_<INDEX>}}`（同值去重，保持上下文一致性），原值隔离保存在当前 Context 的 `Vault` 中。
+- **流式拼接**：解析 SSE JSON 帧，按 `choice.index` 及字段（`content`、`reasoning_content`、`tool_calls[].function.arguments`）各自维护独立的滑动窗口缓冲器。当占位符被拆到相邻两个 SSE 事件（包括末尾两个 `}}` 被拆开）时，网关暂存未闭合前缀，待后续事件闭合后完成替换再向下游 `http.Flusher` 输出。
 
-### 2. 并发信号量与 TTFT 首字超时降级 (Circuit Breaker & Fallback)
+### 2. 并发信号量、TTFT 降级与三态熔断器 (Circuit Breaker & Fallback)
 - 不依赖模糊的操作系统 GPU/内存指标，采用带权通道信号量管理本地最大并发数（`max_concurrent_local`）。
-- 建立独立的 **TTFT（Time-To-First-Token）首字看门狗**：在向本地发起请求时启动计时器。若本地并发满载、网络拒连或超出 `ttft_timeout_ms` 未吐出首个有效 Byte/Chunk，网关在向客户端输出任何内容前立即触发静默熔断，无缝重写请求转交云端保底端点（Cloud Tier）。
+- **TTFT 看门狗与内部流式聚合**：向本地发起请求时启动首字计时器。若本地并发满载、网络拒连或超出 `ttft_timeout_ms` 未吐出首个有效 Byte/Chunk，网关在向客户端输出任何内容前立即触发静默降级，无缝重写请求转交云端保底端点（Cloud Tier）。对于路由至本地的非流式请求，网关内部自动以 `stream: true`（附带 `include_usage: true`）拉流并受 `local.stream_idle_timeout_ms` 空闲超时保护，聚合成完整响应返回；若流中途截断返回 `502`，空闲超时返回 `504`。
+- **三态熔断器（Closed / Open / Half-Open）**：连续出现 `breaker_failure_threshold` 次本地失败（连接失败、TTFT 超时、5xx、流中断）后进入 Open 状态，在 `breaker_cooldown_ms` 冷却期内直接路由云端不再干等 TTFT，冷却结束后放行单个 Half-Open 探测请求验证恢复。
 
 ### 3. 模型别名动态重写 (Model Aliasing)
 - 客户端无需感知底层模型差异，统一请求 `default` 或 `gpt-4o-mini`。
@@ -118,16 +119,20 @@ go test -v ./...
 参考 `configs/edgecat.example.yaml` 编写配置文件：
 ```yaml
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
   write_timeout_ms: 120000
   # SSE 专用：长流按"空闲时长"而非"总时长"限流，本地慢速模型可长时间持续输出
   stream_idle_timeout_ms: 300000
+  max_request_body_bytes: 10485760
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"
   max_concurrent_local: 2
   ttft_timeout_ms: 3500
+  stream_idle_timeout_ms: 30000
+  breaker_failure_threshold: 3
+  breaker_cooldown_ms: 30000
   model_mapping:
     "default": "qwen2.5:7b"
     "gpt-4o-mini": "qwen2.5:7b"
@@ -170,8 +175,9 @@ EdgeCat 兼容 **OpenAI ChatCompletion 协议** 的基础对话与工具调用�
 - **`POST /v1/chat/completions`**：支持标准非流式 JSON 及实时 SSE 流式（`stream: true`）传输。
 - **协议覆盖范围**：`tools` / `tool_choice` / `tool_calls` / `reasoning_content` / 多模态 `content` 数组 / `temperature` / `top_p` / `max_tokens` / `seed` 等字段均可无损透传。
 - **尚未实现**：`/v1/embeddings`、`/v1/completions`、`/v1/responses` 等其它端点（请求返回 404）。
-- **`GET /health`**：实时返回本地/云端端点状态、本地活动信号量并发数、累计降级次数以及异步审计日志吞吐指标。
-- **`GET /v1/models`**：提供 OpenAI 兼容的模型列表发现。
+- **`GET /health`**：最小化免鉴权探活端点（仅返回 `{"status":"healthy"}`），不泄露上游端点、客户端身份或配额数据。
+- **`GET /admin/status`**（别名 `/v1/admin/status`）：需通过鉴权后访问的运维视图，返回本地/云端配置状态、并发占用、熔断器状态、`clients_usage`、`next_quota_reset` 及异步审计吞吐指标。
+- **`GET /v1/models`**：提供 OpenAI 兼容的逻辑模型列表发现（不泄露后端物理模型名）。
 
 > 💡 **架构决策与演进路线沉淀**：
 > - [本地测试与验证指南 (Testing Guide)](docs/testing_guide_zh.md)（单元测试、全链路 Mock、cURL 手工验证与客户端接入）
@@ -189,17 +195,17 @@ EdgeCat 秉持 **“网关是本体，中枢是用法”** 的极简工程哲学
    常驻本机 `127.0.0.1:8080`，作为 **PatchCat**（前端可视化 DAG 工作流编排器）、IDE 助手与 CLI 工具的本地算力与隐私底座。对外分享工作流时仅导出不含密钥的 PatchCat DAG JSON，各自连接本机 EdgeCat。
 2. **家庭 / 小团队内网共享网关（Homelab / NAS LAN Gateway）**  
    单二进制直接部署在家庭 NAS、Mac mini 或软路由上，供家庭或 2~3 人极客团队的多台设备局域网共用：
-   - **统一密钥托管（Phase 2 规划）**：云端主 API Key 锁在 NAS 配置文件中，客户端仅持按设备签发的轻量令牌；
-   - **本地免费无限白嫖，云端降级硬配额（Phase 2 规划）**：日常请求优先白嫖内网免费 GPU（Ollama）；付费云端降级将按设备执行每日限额并分账审计，杜绝前端 XSS 或 Agent 死循环刷爆账单；
-   - **零隐私落盘威胁模型（当前生效）**：PII `Vault` 为 100% 单请求内存生命周期（请求结束即销毁），`audit_logs` 仅记录脱敏计数、路由去向与延迟指标，绝不落盘原始对话内容与敏感词明文，从根源上消除数据库副本离线泄露风险。
-
-> ⚠️ **当前版本尚无入站鉴权**：默认监听 `0.0.0.0`，仅可在可信局域网内使用。子令牌鉴权与 Fail-Closed 门卫见 [Roadmap Phase 2](docs/roadmap_zh.md)。
+   - **Fail-Closed 局域网门卫与可撤销子令牌**：默认监听 `127.0.0.1`。若配置为 `0.0.0.0` 或局域网 IP，必须开启 `auth.enabled: true` 并配置有效 `auth.clients` 令牌才能启动（除非显式设置 `allow_insecure_lan: true`）。云端主 API Key 锁在 NAS 配置文件中，客户端仅持按设备签发的 Bearer 子令牌。
+   - **本地免费无限使用，云端降级硬配额**：本地 Ollama 算力不设限；触发云端降级时按客户端执行 `daily_cloud_limit` 每日限额（`0` 无限、`-1` 仅本地、`>0` 每日上限），计数原子持久化于 SQLite `daily_client_cloud_usage` 表，杜绝前端 XSS 或 Agent 死循环刷爆账单。
+   - **CORS 默认拒绝与 Chrome PNA**：`allowed_origins` 为空时默认拒绝所有跨域请求；仅对白名单内来源返回 CORS 及 `Access-Control-Allow-Private-Network: true` 响应头。
+   - **零隐私落盘威胁模型**：PII `Vault` 为单请求内存生命周期（请求结束即销毁），`audit_logs` 仅记录脱敏计数、客户端名、路由去向与延迟指标，绝不落盘原始对话内容与敏感词明文。
 
 ### 客户端零侵入接入示例：
 - **桌面与 Web 客户端 (Chatbox / Cherry Studio / NextChat)**：
   - API 格式：选择 `OpenAI API`
   - API 地址 (Base URL)：`http://localhost:8080/v1`
-  - API Key：任意填写（如 `none`）
+  - API Key：开启 `auth.enabled: true` 时填写对应 `auth.clients` 令牌；本机回环未开鉴权时任意填写（如 `none`）
+  - 提示：若桌面客户端（如 Electron 渲染进程）请求携带了 `Origin` 头，需将该来源加入 `server.allowed_origins`（被拒来源会在日志中记录 `[CORS] Rejected origin`）。
 - **Python (官方 `openai` SDK)**：
   ```python
   from openai import OpenAI
@@ -216,6 +222,15 @@ EdgeCat 秉持 **“网关是本体，中枢是用法”** 的极简工程哲学
       if chunk.choices[0].delta.content:
           print(chunk.choices[0].delta.content, end="", flush=True)
   ```
+
+---
+
+## 已知限制与边界 (Known Limitations)
+
+- **基于正则的 PII 识别存在漏报/误报边界**：当前内置正则仅覆盖中国大陆手机号、邮箱、内网 IPv4 及常见 API Key 前缀，尚未覆盖身份证号、银行卡号或非结构化秘密；出站还原也依赖上游模型原样保留 `{{EC_PII_...}}` 占位符。
+- **间接 Prompt 注入的占位符外泄风险**：若云端模型受注入诱导而在 `tool_calls.arguments` 中输出占位符，网关在返回给客户端前会按 Vault 还原为原文。
+- **降级重算代价**：本地 TTFT 超时或返回 5xx 时，网关会切到云端重新发起同一请求；一旦本地已吐出首字，后续流中断将直接返回 `504` 而不会再切云端。
+- **Strict JSON 适用范围**：`strict_json_enabled` 仅对非流式响应生效（支持 `json_object` 与 `X-EdgeCat-Strict-JSON: true`），暂不支持 `json_schema` 校验与流式修复。
 
 ---
 

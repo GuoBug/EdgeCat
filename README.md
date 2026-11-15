@@ -23,7 +23,7 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 3. **Contract Drift & Code Fence Violations**: Local LLMs often ignore `response_format` and wrap outputs in unwanted ````json markdown code blocks, breaking downstream strict serialization contracts.
 4. **Synchronous Audit Latency Penalties**: Traditional gateways write audit logs directly within the HTTP request goroutine, causing severe Time-To-First-Token (TTFT) degradation.
 
-**EdgeCat eliminates these failure modes through six deterministic mechanisms:**
+**EdgeCat addresses these failure modes through six deterministic mechanisms:**
 
 ```
                        ┌──────────────────────────────────────────────┐
@@ -68,13 +68,14 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 
 ## Key Architectural Pillars
 
-### 1. Sliding-Window SSE Rehydration
-- **Ingress Masking**: Inbound requests are scanned for Chinese/international mobile numbers, email addresses, private IPv4 subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8), and API keys. Sensitive entities are substituted with deterministic tokens `{{EC_PII_<TYPE>_<INDEX>}}` and stored in a request-scoped in-memory `Vault`.
-- **Egress Rehydration**: Implements a dual-cursor sliding-window streaming buffer. If an unclosed placeholder prefix (such as `{{EC_` or `{{EC_PII_`) is detected at the tail of an incoming chunk, the gateway holds back the unclosed slice in a lightweight pending buffer while flushing safe leading tokens immediately. Once subsequent chunks close the placeholder, the original value is restored and flushed via `http.Flusher`.
+### 1. Frame-Level Sliding-Window SSE Rehydration
+- **Ingress Masking**: Inbound requests are scanned for Chinese mobile numbers (including `+86`/`86` prefixes and space/hyphen separators), email addresses, private IPv4 subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8), and common API keys. Sensitive entities are substituted with deterministic tokens `{{EC_PII_<TYPE>_<INDEX>}}` and stored in a request-scoped in-memory `Vault`.
+- **Egress Rehydration**: Parses SSE JSON frames and maintains independent sliding-window buffers per choice and field (`content`, `reasoning_content`, `tool_calls[].function.arguments`). When a placeholder is split across adjacent SSE events (including a split closing `}}`), the unclosed prefix is held until subsequent events close it, then restored and flushed via `http.Flusher`.
 
-### 2. Concurrency Semaphore & TTFT Watchdog Fallback
+### 2. Concurrency Semaphore, TTFT Fallback & Circuit Breaker
 - Replaces OS memory guesswork with a strict channel semaphore (`chan struct{}`) bounded by `max_concurrent_local`.
-- Incorporates a **Time-To-First-Token (TTFT) Circuit Breaker**: when dispatching to the local worker, an independent timer monitors the first byte/chunk. If local concurrency is saturated, connections are refused, or TTFT exceeds `ttft_timeout_ms`, the gateway silently cancels the local context, releases the semaphore, and re-routes the redacted payload to the Cloud Fallback Tier **before any headers are flushed to the client**.
+- **TTFT Watchdog & Stream Aggregation**: When dispatching to the local worker, an independent timer monitors the first byte/chunk. If local concurrency is saturated, connections are refused, or TTFT exceeds `ttft_timeout_ms`, the gateway silently cancels the local context, releases the semaphore, and re-routes to the Cloud Fallback Tier **before any headers are flushed**. For non-streaming client requests routed locally, EdgeCat internally streams from the local tier (`stream: true` with `include_usage`) and aggregates chunks under `local.stream_idle_timeout_ms`, detecting mid-stream truncation (`502`) and stalls (`504`).
+- **Closed / Open / Half-Open Circuit Breaker**: After `breaker_failure_threshold` consecutive local failures (connection errors, TTFT timeouts, 5xx, stream stalls), the breaker opens for `breaker_cooldown_ms` and fast-routes requests to cloud without waiting for TTFT, then admits a single half-open probe to test recovery.
 
 ### 3. Transparent Model Aliasing
 - Upstream applications use unified logical names (e.g., `default` or `gpt-4o-mini`).
@@ -99,7 +100,7 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 ## Quickstart
 
 ### 1. Build
-EdgeCat supports 100% CGO-free static compilation:
+EdgeCat supports CGO-free static compilation (`CGO_ENABLED=0`):
 ```bash
 # Using Makefile
 make build
@@ -119,17 +120,21 @@ go test -v ./...
 Review `configs/edgecat.example.yaml`:
 ```yaml
 server:
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
   write_timeout_ms: 120000
   # SSE only: streams are bounded by idle time, not total duration, so slow
   # local models can keep producing tokens for as long as they need.
   stream_idle_timeout_ms: 300000
+  max_request_body_bytes: 10485760
 
 local:
   endpoint: "http://127.0.0.1:11434/v1"
   max_concurrent_local: 2
   ttft_timeout_ms: 3500
+  stream_idle_timeout_ms: 30000
+  breaker_failure_threshold: 3
+  breaker_cooldown_ms: 30000
   model_mapping:
     "default": "qwen2.5:7b"
     "gpt-4o-mini": "qwen2.5:7b"
@@ -172,8 +177,9 @@ EdgeCat is wire-compatible with the **OpenAI ChatCompletion Protocol** for chat 
 - **`POST /v1/chat/completions`**: Supports standard JSON responses and low-latency SSE streaming (`stream: true`).
 - **Protocol coverage**: `tools` / `tool_choice` / `tool_calls` / `reasoning_content` / multimodal `content` arrays / `temperature` / `top_p` / `max_tokens` / `seed` are all forwarded losslessly.
 - **Not implemented**: `/v1/embeddings`, `/v1/completions`, `/v1/responses` (these return 404).
-- **`GET /health`**: Returns real-time health metrics, active concurrency slots, fallback statistics, and audit pipeline throughput.
-- **`GET /v1/models`**: Provides OpenAI-compatible model catalog discovery.
+- **`GET /health`**: Minimal unauthenticated liveness probe (`{"status":"healthy"}`); does not expose upstream endpoints, client identities, or quota counters.
+- **`GET /admin/status`** (alias `/v1/admin/status`): Authenticated operational view exposing local/cloud configuration status, concurrency slots, circuit breaker state, `clients_usage`, `next_quota_reset`, and audit throughput.
+- **`GET /v1/models`**: Provides OpenAI-compatible logical model catalog discovery (without leaking physical backend model names).
 
 > 💡 **Architecture Decision Records & Roadmap**:
 > - [Testing & Verification Guide](docs/testing_guide.md) (Automated test suites, end-to-end mocks, cURL inspection, client pairing)
@@ -191,17 +197,17 @@ Guided by the principle that **"the gateway is the core, while a 'Personal AI Hu
    Runs on `127.0.0.1:8080` as the local runtime companion for **PatchCat** (visual DAG workflow orchestrator), IDE coding assistants, and CLI agents. Workflows are shared via stateless PatchCat DAG JSON definitions rather than exposing live server endpoints.
 2. **Homelab / Small-Team LAN Gateway (NAS / Home Server)**  
    Runs as a ~12MB static binary on a home NAS, Mac mini, or router to serve 2–3 people across multiple devices on a trusted local network:
-   - **Centralized Cloud Key Vaulting** (Phase 2): Master Cloud API Keys remain on the NAS; client devices will use revocable per-device sub-tokens;
-   - **Unlimited Free Local Compute, Capped Paid Cloud Fallback** (Phase 2): Local Ollama traffic runs uncapped, while paid cloud fallback calls will be bounded by per-device daily quotas and SQLite attribution to prevent runaway agent loops or browser XSS from draining cloud billing;
-   - **Zero-Disk PII Threat Model** (active today): The PII `Vault` is 100% ephemeral and request-scoped in RAM. `audit_logs` stores only operational telemetry (`request_id`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—never raw prompts or plaintext PII, eliminating offline database replica leakage risks.
-
-> ⚠️ **This version has no inbound authentication yet**: it binds `0.0.0.0` by default and must only be used on a trusted LAN. Sub-token auth and the Fail-Closed guard are tracked in [Roadmap Phase 2](docs/roadmap.md).
+   - **Fail-Closed LAN Guard & Revocable Sub-Tokens**: Binds `127.0.0.1` by default. Binding to `0.0.0.0` or a LAN IP fails startup unless `auth.enabled: true` is configured with valid `auth.clients` tokens (or `allow_insecure_lan: true` is explicitly set). Master Cloud API Keys remain on the NAS; client devices use revocable Bearer sub-tokens.
+   - **Unlimited Free Local Compute, Capped Paid Cloud Fallback**: Local Ollama traffic runs uncapped, while paid cloud fallback calls are enforced by per-device `daily_cloud_limit` quotas (`0` unlimited, `-1` local-only, `>0` daily cap) persisted in SQLite (`daily_client_cloud_usage`).
+   - **Default-Deny CORS & PNA**: Cross-origin requests are denied by default (`allowed_origins: []`). Only explicitly allowlisted origins receive CORS and Chrome Private Network Access (`Access-Control-Allow-Private-Network: true`) headers.
+   - **Zero-Disk PII Threat Model**: The PII `Vault` is ephemeral and request-scoped in RAM. `audit_logs` stores only operational telemetry (`request_id`, `client_name`, `route_target`, `model`, `latency_ms`, `ttft_ms`, `pii_redacted_count`, `status`)—never raw prompts or plaintext PII.
 
 ### Zero-Invasiveness Client Setup:
 - **Desktop & Web Clients (Chatbox / Cherry Studio / NextChat)**:
   - API Provider: Select `OpenAI API`
   - Base URL: `http://localhost:8080/v1`
-  - API Key: Any value (e.g., `none`)
+  - API Key: Your client token from `auth.clients` when `auth.enabled: true`, or any value (e.g., `none`) on local loopback with auth disabled.
+  - Note: If a desktop/Electron client sends an `Origin` header, add that origin to `server.allowed_origins` (rejected origins are logged as `[CORS] Rejected origin`).
 - **Python (Official `openai` SDK)**:
   ```python
   from openai import OpenAI
@@ -218,6 +224,15 @@ Guided by the principle that **"the gateway is the core, while a 'Personal AI Hu
       if chunk.choices[0].delta.content:
           print(chunk.choices[0].delta.content, end="", flush=True)
   ```
+
+---
+
+## Known Limitations
+
+- **Regex-based PII detection**: Only covers Chinese mobile numbers, emails, private IPv4 addresses, and common API key prefixes; national IDs, bank cards, and unstructured secrets are not matched. Rehydration also assumes the upstream LLM echoes `{{EC_PII_...}}` placeholders verbatim.
+- **Placeholder exfiltration via indirect prompt injection**: If a cloud model is tricked into embedding a placeholder inside `tool_calls.arguments`, EdgeCat rehydrates it before returning to the client.
+- **Fallback re-computation**: If local inference times out on TTFT or returns 5xx, EdgeCat re-dispatches the request to the cloud tier; once the first local token arrives, mid-stream stalls fail with `504` instead of falling back.
+- **Strict JSON scope**: `strict_json_enabled` validates `json_object` / `X-EdgeCat-Strict-JSON: true` on non-streaming responses only; `json_schema` validation and SSE stream repair are not implemented.
 
 ---
 
