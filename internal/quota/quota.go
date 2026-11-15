@@ -22,12 +22,21 @@ const (
 	StatusLocalOnlyDisallowed
 )
 
+type quotaDelta struct {
+	client string
+	date   string
+	delta  int
+}
+
 // Manager handles in-memory fast atomic checks and SQLite persistence for daily cloud quotas.
 type Manager struct {
-	db     *sql.DB
-	limits map[string]int // clientName -> daily_cloud_limit
-	mu     sync.RWMutex
-	counts map[string]map[string]int // dateStr (YYYY-MM-DD) -> clientName -> count
+	db        *sql.DB
+	limits    map[string]int // clientName -> daily_cloud_limit
+	mu        sync.RWMutex
+	counts    map[string]map[string]int // dateStr (YYYY-MM-DD) -> clientName -> count
+	persistCh chan quotaDelta
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // NewManager initializes the quota manager, loading today's persistent counters from SQLite.
@@ -38,9 +47,10 @@ func NewManager(db *sql.DB, clients []config.ClientConfig) (*Manager, error) {
 	}
 
 	m := &Manager{
-		db:     db,
-		limits: limits,
-		counts: make(map[string]map[string]int),
+		db:        db,
+		limits:    limits,
+		counts:    make(map[string]map[string]int),
+		persistCh: make(chan quotaDelta, 4096),
 	}
 
 	today := m.currentDateString()
@@ -58,9 +68,38 @@ func NewManager(db *sql.DB, clients []config.ClientConfig) (*Manager, error) {
 				}
 			}
 		}
+		m.wg.Add(1)
+		go m.persistWorker()
 	}
 
 	return m, nil
+}
+
+func (m *Manager) persistWorker() {
+	defer m.wg.Done()
+	const query = `
+		INSERT INTO daily_client_cloud_usage (client_name, usage_date, cloud_calls, updated_at)
+		VALUES (?, ?, MAX(0, ?), CURRENT_TIMESTAMP)
+		ON CONFLICT(client_name, usage_date) DO UPDATE SET
+			cloud_calls = MAX(0, daily_client_cloud_usage.cloud_calls + ?),
+			updated_at = CURRENT_TIMESTAMP;
+	`
+	for d := range m.persistCh {
+		if m.db != nil {
+			_, _ = m.db.Exec(query, d.client, d.date, d.delta, d.delta)
+		}
+	}
+}
+
+// Close drains pending quota persistence writes and stops the background worker.
+func (m *Manager) Close() {
+	if m == nil {
+		return
+	}
+	m.closeOnce.Do(func() {
+		close(m.persistCh)
+		m.wg.Wait()
+	})
 }
 
 // currentDateString returns the current calendar date in local server timezone (D4: local day expectation).
@@ -110,21 +149,7 @@ func (m *Manager) CheckAndIncrementCloud(clientName string) Status {
 	}
 
 	todayMap[clientName]++
-	newCount := todayMap[clientName]
-
-	// Persist asynchronously/synchronously to SQLite (D2)
-	if m.db != nil {
-		go func(client, date string, count int) {
-			query := `
-				INSERT INTO daily_client_cloud_usage (client_name, usage_date, cloud_calls, updated_at)
-				VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-				ON CONFLICT(client_name, usage_date) DO UPDATE SET
-					cloud_calls = ?,
-					updated_at = CURRENT_TIMESTAMP;
-			`
-			_, _ = m.db.Exec(query, client, date, count, count)
-		}(clientName, today, newCount)
-	}
+	m.enqueueDelta(clientName, today, 1)
 
 	return StatusAllowed
 }
@@ -137,19 +162,50 @@ func (m *Manager) incrementLocked(clientName string) {
 		m.counts[today] = todayMap
 	}
 	todayMap[clientName]++
-	newCount := todayMap[clientName]
+	m.enqueueDelta(clientName, today, 1)
+}
 
-	if m.db != nil {
-		go func(client, date string, count int) {
-			query := `
+// RefundCloud returns 1 consumed cloud quota unit when a cloud upstream call fails
+// before serving a response (e.g. connection failure or 5xx).
+func (m *Manager) RefundCloud(clientName string) {
+	if m == nil {
+		return
+	}
+	if clientName == "" {
+		clientName = "anonymous"
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	today := m.currentDateString()
+	todayMap, exists := m.counts[today]
+	if !exists || todayMap[clientName] <= 0 {
+		return
+	}
+	todayMap[clientName]--
+	m.enqueueDelta(clientName, today, -1)
+}
+
+func (m *Manager) enqueueDelta(clientName, date string, delta int) {
+	if m.db == nil {
+		return
+	}
+	select {
+	case m.persistCh <- quotaDelta{client: clientName, date: date, delta: delta}:
+	default:
+		// Channel saturated under extreme load; persist synchronously in a fallback goroutine
+		// using atomic SQL addition so increments are never lost or overwritten.
+		go func(c, dt string, dl int) {
+			const query = `
 				INSERT INTO daily_client_cloud_usage (client_name, usage_date, cloud_calls, updated_at)
-				VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+				VALUES (?, ?, MAX(0, ?), CURRENT_TIMESTAMP)
 				ON CONFLICT(client_name, usage_date) DO UPDATE SET
-					cloud_calls = ?,
+					cloud_calls = MAX(0, daily_client_cloud_usage.cloud_calls + ?),
 					updated_at = CURRENT_TIMESTAMP;
 			`
-			_, _ = m.db.Exec(query, client, date, count, count)
-		}(clientName, today, newCount)
+			_, _ = m.db.Exec(query, c, dt, dl, dl)
+		}(clientName, date, delta)
 	}
 }
 

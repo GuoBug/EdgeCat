@@ -56,12 +56,14 @@ type ClientConfig struct {
 
 // LocalConfig configures the local inference tier (e.g., Ollama / vLLM / llama.cpp).
 type LocalConfig struct {
-	Endpoint            string            `yaml:"endpoint" json:"endpoint"`
-	APIKey              string            `yaml:"api_key" json:"api_key"`
-	MaxConcurrentLocal  int               `yaml:"max_concurrent_local" json:"max_concurrent_local"`
-	TTFTTimeoutMs       int               `yaml:"ttft_timeout_ms" json:"ttft_timeout_ms"`
-	StreamIdleTimeoutMs int               `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
-	ModelMapping        map[string]string `yaml:"model_mapping" json:"model_mapping"`
+	Endpoint                string            `yaml:"endpoint" json:"endpoint"`
+	APIKey                  string            `yaml:"api_key" json:"api_key"`
+	MaxConcurrentLocal      int               `yaml:"max_concurrent_local" json:"max_concurrent_local"`
+	TTFTTimeoutMs           int               `yaml:"ttft_timeout_ms" json:"ttft_timeout_ms"`
+	StreamIdleTimeoutMs     int               `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
+	BreakerFailureThreshold int               `yaml:"breaker_failure_threshold" json:"breaker_failure_threshold"`
+	BreakerCooldownMs       int               `yaml:"breaker_cooldown_ms" json:"breaker_cooldown_ms"`
+	ModelMapping            map[string]string `yaml:"model_mapping" json:"model_mapping"`
 }
 
 // CloudConfig configures the cloud fallback tier (e.g., OpenAI / DeepSeek / Qwen API).
@@ -114,11 +116,13 @@ func DefaultConfig() *Config {
 			Clients: []ClientConfig{},
 		},
 		Local: LocalConfig{
-			Endpoint:            "http://127.0.0.1:11434/v1",
-			APIKey:              "",
-			MaxConcurrentLocal:  2,
-			TTFTTimeoutMs:       3500,
-			StreamIdleTimeoutMs: 30000,
+			Endpoint:                "http://127.0.0.1:11434/v1",
+			APIKey:                  "",
+			MaxConcurrentLocal:      2,
+			TTFTTimeoutMs:           3500,
+			StreamIdleTimeoutMs:     30000,
+			BreakerFailureThreshold: 3,
+			BreakerCooldownMs:       30000,
 			ModelMapping: map[string]string{
 				"default":     "qwen2.5:7b",
 				"gpt-4o-mini": "qwen2.5:7b",
@@ -237,6 +241,12 @@ func applySanityChecks(cfg *Config) {
 	}
 	if cfg.Local.StreamIdleTimeoutMs <= 0 {
 		cfg.Local.StreamIdleTimeoutMs = 30000
+	}
+	if cfg.Local.BreakerFailureThreshold <= 0 {
+		cfg.Local.BreakerFailureThreshold = 3
+	}
+	if cfg.Local.BreakerCooldownMs <= 0 {
+		cfg.Local.BreakerCooldownMs = 30000
 	}
 	if cfg.Contract.MaxRepairAttempts < 0 {
 		cfg.Contract.MaxRepairAttempts = 0

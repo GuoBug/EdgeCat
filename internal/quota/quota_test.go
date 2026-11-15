@@ -3,6 +3,7 @@ package quota_test
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/patchcat-dev/edgecat/internal/config"
@@ -68,5 +69,51 @@ func TestQuotaManager_Enforcement(t *testing.T) {
 		if status := qm.CheckAndIncrementCloud("charlie-free"); status != quota.StatusAllowed {
 			t.Fatalf("expected unlimited call %d allowed for charlie, got %v", i, status)
 		}
+	}
+	qm.Close()
+}
+
+func TestQuotaManager_ConcurrentPersistAndRefund(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	clients := []config.ClientConfig{
+		{Name: "nas-user", DailyCloudLimit: 200},
+	}
+
+	qm, err := quota.NewManager(db, clients)
+	if err != nil {
+		t.Fatalf("failed to create quota manager: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if status := qm.CheckAndIncrementCloud("nas-user"); status != quota.StatusAllowed {
+				t.Errorf("unexpected status: %v", status)
+				return
+			}
+			if idx%10 == 0 {
+				qm.RefundCloud("nas-user")
+			}
+		}(i)
+	}
+	wg.Wait()
+	qm.Close()
+
+	// Re-open Manager against the same DB to verify persisted count == 90 (100 - 10 refunds)
+	qm2, err := quota.NewManager(db, clients)
+	if err != nil {
+		t.Fatalf("failed to reload quota manager: %v", err)
+	}
+	defer qm2.Close()
+
+	summary := qm2.ClientUsageSummary()
+	used := summary["nas-user"]["today_cloud_calls"]
+	if used != 90 {
+		t.Fatalf("expected persisted usage 90 after 100 increments and 10 refunds, got %v", used)
 	}
 }

@@ -95,6 +95,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[Init] Failed to initialize quota manager: %v", err)
 	}
+	defer quotaMgr.Close()
 
 	// 7. Initialize Proxy Handler
 	handler := proxy.NewHandler(cfg, masker, r, guard, auditLogger, quotaMgr)

@@ -17,9 +17,6 @@ import (
 	"time"
 )
 
-// ErrUpstreamIdleTimeout is returned when an upstream stream is silent longer than the idle timeout.
-var ErrUpstreamIdleTimeout = errors.New("upstream idle timeout")
-
 // StreamAggregator parses SSE chunks from a model stream and aggregates them into
 // a complete non-streaming chat completion JSON response object.
 type StreamAggregator struct {
@@ -290,6 +287,7 @@ func ReadAndAggregateStream(
 	})
 	defer timer.Stop()
 
+	doneSeen := false
 	for {
 		lineBytes, err := reader.ReadBytes('\n')
 		if len(lineBytes) > 0 {
@@ -298,6 +296,7 @@ func ReadAndAggregateStream(
 			if strings.HasPrefix(line, "data:") {
 				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if payload == "[DONE]" {
+					doneSeen = true
 					break
 				}
 				if strings.HasPrefix(payload, "{") {
@@ -305,6 +304,10 @@ func ReadAndAggregateStream(
 					dec := json.NewDecoder(strings.NewReader(payload))
 					dec.UseNumber()
 					if decErr := dec.Decode(&chunkObj); decErr == nil && chunkObj != nil {
+						// vLLM / Ollama / llama.cpp report mid-stream failures in-band.
+						if msg, isErr := inBandError(chunkObj); isErr {
+							return nil, &UpstreamStreamError{Message: msg}
+						}
 						aggregator.FeedChunk(chunkObj)
 					}
 				}
@@ -312,11 +315,11 @@ func ReadAndAggregateStream(
 		}
 
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
 			if timedOut.Load() {
 				return nil, ErrUpstreamIdleTimeout
+			}
+			if errors.Is(err, io.EOF) {
+				break
 			}
 			return nil, err
 		}
@@ -326,5 +329,31 @@ func ReadAndAggregateStream(
 		return nil, ErrUpstreamIdleTimeout
 	}
 
+	// A stream that ends without [DONE] and without any finish_reason was cut
+	// off (e.g. the local backend crashed or ran out of VRAM). Returning the
+	// partial text as a synthesized "stop" would hand truncated output to the
+	// client as if it were complete.
+	if !doneSeen && !aggregator.finishSeen {
+		return nil, ErrUpstreamTruncated
+	}
+
 	return aggregator.Build(fallbackModel)
+}
+
+// inBandError detects an SSE chunk of the form {"error": ...}.
+func inBandError(chunkObj map[string]any) (string, bool) {
+	raw, exists := chunkObj["error"]
+	if !exists || raw == nil {
+		return "", false
+	}
+	switch v := raw.(type) {
+	case string:
+		return v, true
+	case map[string]any:
+		if msg, ok := v["message"].(string); ok && msg != "" {
+			return msg, true
+		}
+	}
+	b, _ := json.Marshal(raw)
+	return string(b), true
 }

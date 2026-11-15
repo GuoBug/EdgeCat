@@ -85,15 +85,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Validate client auth token if enabled
 	client, authed := h.authenticate(r)
 	if !authed {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "unauthorized: valid Bearer token required in Authorization header",
-				"type":    "invalid_request_error",
-				"code":    "invalid_api_key",
-			},
-		})
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_request_error", "invalid_api_key", "unauthorized: valid Bearer token required in Authorization header")
 		return
 	}
 
@@ -131,15 +123,8 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	if !allowed {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusForbidden)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "CORS origin not allowed",
-				"type":    "invalid_request_error",
-				"code":    "origin_not_allowed",
-			},
-		})
+		log.Printf("[CORS] Rejected origin: %q", origin)
+		writeOpenAIError(w, http.StatusForbidden, "invalid_request_error", "origin_not_allowed", "CORS origin not allowed")
 		return true
 	}
 
@@ -197,6 +182,8 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	breakerState, breakerFailures := h.router.BreakerState()
+
 	// Detailed operational status for authenticated administrative inspection.
 	resp := map[string]any{
 		"status": "healthy",
@@ -206,6 +193,10 @@ func (h *Handler) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			"active_concurrency": h.router.CurrentLocalConcurrency(),
 			"max_concurrency":    h.router.MaxLocalConcurrency(),
 			"fallbacks_total":    h.router.TotalFallbacks(),
+			"circuit_breaker": map[string]any{
+				"state":                breakerState,
+				"consecutive_failures": breakerFailures,
+			},
 		},
 		"cloud_tier": map[string]any{
 			"configured": h.cfg.Cloud.Endpoint != "",
@@ -277,15 +268,7 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	ct := r.Header.Get("Content-Type")
 	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0]))
 	if mediaType != "application/json" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnsupportedMediaType)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "unsupported media type: Content-Type must be application/json",
-				"type":    "invalid_request_error",
-				"code":    "unsupported_media_type",
-			},
-		})
+		writeOpenAIError(w, http.StatusUnsupportedMediaType, "invalid_request_error", "unsupported_media_type", "unsupported media type: Content-Type must be application/json")
 		return
 	}
 
@@ -302,25 +285,17 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": map[string]any{
-					"message": fmt.Sprintf("request body exceeds limit of %d bytes", maxBytes),
-					"type":    "invalid_request_error",
-					"code":    "payload_too_large",
-				},
-			})
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "payload_too_large", fmt.Sprintf("request body exceeds limit of %d bytes", maxBytes))
 			return
 		}
-		http.Error(w, `{"error": "failed to read request body"}`, http.StatusBadRequest)
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid_body", "failed to read request body")
 		return
 	}
 	_ = r.Body.Close()
 
 	req, err := ParseRequest(bodyBytes)
 	if err != nil {
-		http.Error(w, `{"error": "malformed JSON request body"}`, http.StatusBadRequest)
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "malformed_json", "malformed JSON request body")
 		return
 	}
 
@@ -347,11 +322,60 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	// README: streaming keeps its first-token latency instead).
 	strictJSON := h.guard.StrictJSONEnabled && clientWantsStrictJSON(r, req)
 
-	if req.Stream() {
-		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, client)
-	} else {
-		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON, client)
+	clientName := "anonymous"
+	if client != nil {
+		clientName = clientNameOf(client.Name)
 	}
+
+	if req.Stream() {
+		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, clientName)
+	} else {
+		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON, clientName)
+	}
+}
+
+func (h *Handler) recordAudit(reqID, clientName, target, model string, startTime time.Time, ttftMs int64, piiRedacted, status int) {
+	h.audit.Log(&audit.Record{
+		RequestID:        reqID,
+		ClientName:       clientNameOf(clientName),
+		RouteTarget:      target,
+		Model:            model,
+		LatencyMs:        time.Since(startTime).Milliseconds(),
+		TTFTMs:           ttftMs,
+		PIIRedactedCount: piiRedacted,
+		Status:           status,
+		CreatedAt:        startTime,
+	})
+}
+
+// checkCloudQuota enforces daily cloud limits in the pre-WriteHeader window.
+func (h *Handler) checkCloudQuota(w http.ResponseWriter, clientName string) bool {
+	if h.quotaMgr == nil {
+		return true
+	}
+	status := h.quotaMgr.CheckAndIncrementCloud(clientName)
+	if status == quota.StatusLocalOnlyDisallowed {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "service_unavailable_error", "cloud_fallback_disabled", "local tier unavailable and cloud fallback is disallowed for client")
+		return false
+	}
+	if status == quota.StatusQuotaExceeded {
+		writeOpenAIError(w, http.StatusTooManyRequests, "insufficient_quota", "daily_cloud_limit_exceeded", "daily cloud fallback quota exceeded for client")
+		return false
+	}
+	return true
+}
+
+// classifyLocalError maps a local-tier failure to a circuit-breaker outcome.
+// Client disconnects are neutral; 4xx responses prove the local server is alive.
+func classifyLocalError(ctx context.Context, err error) router.Outcome {
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return router.OutcomeNeutral
+	}
+	var stErr *upstreamStatusError
+	if errors.As(err, &stErr) && stErr.code >= 400 && stErr.code < 500 {
+		return router.OutcomeSuccess
+	}
+	return router.OutcomeFailure
 }
 
 // clientWantsStrictJSON reports whether this specific call opted into contract
@@ -372,11 +396,11 @@ func (h *Handler) handleStreaming(
 	vault *filter.Vault,
 	startTime time.Time,
 	piiRedacted int,
-	client *config.ClientConfig,
+	clientName string,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, `{"error": "streaming unsupported by client"}`, http.StatusInternalServerError)
+		writeOpenAIError(w, http.StatusInternalServerError, "server_error", "streaming_unsupported", "streaming unsupported by client")
 		return
 	}
 
@@ -391,6 +415,7 @@ func (h *Handler) handleStreaming(
 	var finalModel = decision.TargetModel
 	var ttftMs int64 = 0
 	var firstChunk []byte
+	var usingLocal bool
 
 	// If Local was acquired, attempt local streaming with strict TTFT timeout watcher
 	if decision.AcquiredLocal {
@@ -402,11 +427,20 @@ func (h *Handler) handleStreaming(
 			upstreamResp = resp
 			firstChunk = chunk
 			ttftMs = capturedTTFT
+			usingLocal = true
 		} else {
-			// Local failed or TTFT timed out! Trigger fallback to Cloud tier
-			log.Printf("[Proxy %s] Local streaming fallback (%v). Rerouting to Cloud tier.", reqID, err)
+			outcome := classifyLocalError(r.Context(), err)
+			h.router.RecordLocalOutcome(outcome)
 			h.router.ReleaseLocal()
 			decision.AcquiredLocal = false
+
+			if outcome == router.OutcomeNeutral {
+				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, StatusClientClosedRequest)
+				return
+			}
+
+			// Local failed or TTFT timed out! Trigger fallback to Cloud tier
+			log.Printf("[Proxy %s] Local streaming fallback (%v). Rerouting to Cloud tier.", reqID, err)
 			h.router.RecordFallback()
 
 			finalTarget = router.TargetCloud
@@ -416,44 +450,17 @@ func (h *Handler) handleStreaming(
 
 	// If not routed to local or local timed out, route to Cloud
 	if upstreamResp == nil {
-		clientName := "anonymous"
-		if client != nil && client.Name != "" {
-			clientName = client.Name
-		}
-
 		// D1 & R2.3: Check cloud quota in the pre-WriteHeader window
-		if h.quotaMgr != nil {
-			status := h.quotaMgr.CheckAndIncrementCloud(clientName)
-			if status == quota.StatusLocalOnlyDisallowed {
-				// D3: daily_cloud_limit: -1 returns 503 Service Unavailable
-				http.Error(w, `{"error":{"message":"local tier unavailable and cloud fallback is disallowed for client","type":"service_unavailable_error","code":"cloud_fallback_disabled"}}`, http.StatusServiceUnavailable)
-				return
-			}
-			if status == quota.StatusQuotaExceeded {
-				http.Error(w, `{"error":{"message":"daily cloud fallback quota exceeded for client","type":"insufficient_quota","code":"daily_cloud_limit_exceeded"}}`, http.StatusTooManyRequests)
-				return
-			}
+		if !h.checkCloudQuota(w, clientName) {
+			return
 		}
 
 		cloudResp, err := h.callCloudStream(r.Context(), req, finalModel)
 		if err != nil {
+			h.quotaMgr.RefundCloud(clientName)
 			log.Printf("[Proxy %s] Cloud fallback error: %v", reqID, err)
-			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
-			clientName := "anonymous"
-			if client != nil && client.Name != "" {
-				clientName = client.Name
-			}
-			h.audit.Log(&audit.Record{
-				RequestID:        reqID,
-				ClientName:       clientName,
-				RouteTarget:      finalTarget,
-				Model:            finalModel,
-				LatencyMs:        time.Since(startTime).Milliseconds(),
-				TTFTMs:           0,
-				PIIRedactedCount: piiRedacted,
-				Status:           http.StatusBadGateway,
-				CreatedAt:        startTime,
-			})
+			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
+			h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, http.StatusBadGateway)
 			return
 		}
 		upstreamResp = cloudResp
@@ -498,6 +505,7 @@ func (h *Handler) handleStreaming(
 	}
 
 	var eventLines []string
+	streamStatus := http.StatusOK
 	for {
 		lineBytes, readErr := reader.ReadBytes('\n')
 		if len(lineBytes) > 0 {
@@ -539,8 +547,37 @@ func (h *Handler) handleStreaming(
 		if readErr != nil {
 			if upstreamIdleTimedOut.Load() {
 				log.Printf("[Proxy %s] Upstream stream idle timeout (%v)", reqID, idleTimeout)
+				streamStatus = http.StatusGatewayTimeout
+				if len(eventLines) > 0 {
+					writeEvent(eventLines)
+					eventLines = nil
+				}
+				writeEvent([]string{sseErrorEvent("upstream_idle_timeout", "upstream stream idle timeout")})
+			} else if !errors.Is(readErr, io.EOF) {
+				if r.Context().Err() != nil {
+					streamStatus = StatusClientClosedRequest
+				} else {
+					log.Printf("[Proxy %s] Upstream stream read error: %v", reqID, readErr)
+					streamStatus = http.StatusBadGateway
+					if len(eventLines) > 0 {
+						writeEvent(eventLines)
+						eventLines = nil
+					}
+					writeEvent([]string{sseErrorEvent("upstream_stream_error", readErr.Error())})
+				}
 			}
 			break
+		}
+	}
+
+	if usingLocal {
+		switch streamStatus {
+		case http.StatusOK:
+			h.router.RecordLocalOutcome(router.OutcomeSuccess)
+		case StatusClientClosedRequest:
+			h.router.RecordLocalOutcome(router.OutcomeNeutral)
+		default:
+			h.router.RecordLocalOutcome(router.OutcomeFailure)
 		}
 	}
 
@@ -551,27 +588,15 @@ func (h *Handler) handleStreaming(
 	}
 
 	// Flush any remaining tail in rehydrators if stream closed without [DONE]
-	tailEvents := streamRehydrator.FlushPendingChunks()
-	for _, tailEvent := range tailEvents {
-		writeEvent([]string{tailEvent})
+	if streamStatus == http.StatusOK {
+		tailEvents := streamRehydrator.FlushPendingChunks()
+		for _, tailEvent := range tailEvents {
+			writeEvent([]string{tailEvent})
+		}
 	}
 
 	// Log audit record asynchronously
-	clientName := "anonymous"
-	if client != nil && client.Name != "" {
-		clientName = client.Name
-	}
-	h.audit.Log(&audit.Record{
-		RequestID:        reqID,
-		ClientName:       clientName,
-		RouteTarget:      finalTarget,
-		Model:            finalModel,
-		LatencyMs:        time.Since(startTime).Milliseconds(),
-		TTFTMs:           ttftMs,
-		PIIRedactedCount: piiRedacted,
-		Status:           http.StatusOK,
-		CreatedAt:        startTime,
-	})
+	h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, streamStatus)
 }
 
 // newStreamDeadlineRefresher returns a function that pushes the connection write
@@ -660,7 +685,7 @@ func (h *Handler) tryLocalStream(
 	if resp.StatusCode >= 400 {
 		resp.Body.Close()
 		localCancel()
-		return nil, nil, 0, nil, fmt.Errorf("local returned status %d", resp.StatusCode)
+		return nil, nil, 0, nil, &upstreamStatusError{tier: "local", code: resp.StatusCode}
 	}
 
 	// Wait for the first non-empty byte/chunk before TTFT timer expires
@@ -740,7 +765,7 @@ func (h *Handler) callCloudStream(
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("cloud tier returned status %d: %s", resp.StatusCode, string(body))
+		return nil, &upstreamStatusError{tier: "cloud", code: resp.StatusCode, body: string(body)}
 	}
 
 	return resp, nil
@@ -756,7 +781,7 @@ func (h *Handler) handleNonStreaming(
 	startTime time.Time,
 	piiRedacted int,
 	strictJSON bool,
-	client *config.ClientConfig,
+	clientName string,
 ) {
 	var finalTarget = decision.Target
 	var finalModel = decision.TargetModel
@@ -770,13 +795,30 @@ func (h *Handler) handleNonStreaming(
 	// generations to proceed without timing out arbitrarily.
 	if decision.AcquiredLocal {
 		req.fields["stream"] = true
+		prevStreamOpts, hadStreamOpts := req.fields["stream_options"]
+		if !hadStreamOpts {
+			req.fields["stream_options"] = map[string]any{"include_usage": true}
+		}
 		localResp, firstChunk, localTTFT, cancelLocal, localErr := h.tryLocalStream(r.Context(), req, decision.TargetModel)
 		req.fields["stream"] = false // restore client non-streaming setting
+		if hadStreamOpts {
+			req.fields["stream_options"] = prevStreamOpts
+		} else {
+			delete(req.fields, "stream_options")
+		}
 
 		if localErr != nil {
-			log.Printf("[Proxy %s] Local non-streaming TTFT fallback: %v. Rerouting to Cloud.", reqID, localErr)
+			outcome := classifyLocalError(r.Context(), localErr)
+			h.router.RecordLocalOutcome(outcome)
 			h.router.ReleaseLocal()
 			decision.AcquiredLocal = false
+
+			if outcome == router.OutcomeNeutral {
+				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, StatusClientClosedRequest)
+				return
+			}
+
+			log.Printf("[Proxy %s] Local non-streaming TTFT fallback: %v. Rerouting to Cloud.", reqID, localErr)
 			h.router.RecordFallback()
 
 			finalTarget = router.TargetCloud
@@ -799,44 +841,39 @@ func (h *Handler) handleNonStreaming(
 				decision.AcquiredLocal = false
 
 				if aggErr != nil {
-					log.Printf("[Proxy %s] Local stream aggregation failed: %v", reqID, aggErr)
-					clientName := "anonymous"
-					if client != nil && client.Name != "" {
-						clientName = client.Name
+					if r.Context().Err() != nil {
+						h.router.RecordLocalOutcome(router.OutcomeNeutral)
+						h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, StatusClientClosedRequest)
+						return
 					}
+					h.router.RecordLocalOutcome(router.OutcomeFailure)
+					log.Printf("[Proxy %s] Local stream aggregation failed: %v", reqID, aggErr)
 
 					statusCode := http.StatusBadGateway
 					errCode := "local_stream_error"
 					errMsg := fmt.Sprintf("local stream aggregation failed: %v", aggErr)
-					if errors.Is(aggErr, ErrUpstreamIdleTimeout) {
+					var streamErr *UpstreamStreamError
+					switch {
+					case errors.Is(aggErr, ErrUpstreamIdleTimeout):
 						statusCode = http.StatusGatewayTimeout
 						errCode = "upstream_idle_timeout"
 						errMsg = "local stream idle timeout"
+					case errors.Is(aggErr, ErrUpstreamTruncated):
+						statusCode = http.StatusBadGateway
+						errCode = "upstream_truncated"
+						errMsg = "local stream ended unexpectedly before completion"
+					case errors.As(aggErr, &streamErr):
+						statusCode = http.StatusBadGateway
+						errCode = "upstream_stream_error"
+						errMsg = streamErr.Message
 					}
 
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(statusCode)
-					_ = json.NewEncoder(w).Encode(map[string]any{
-						"error": map[string]any{
-							"message": errMsg,
-							"type":    "gateway_error",
-							"code":    errCode,
-						},
-					})
-					h.audit.Log(&audit.Record{
-						RequestID:        reqID,
-						ClientName:       clientName,
-						RouteTarget:      finalTarget,
-						Model:            finalModel,
-						LatencyMs:        time.Since(startTime).Milliseconds(),
-						TTFTMs:           ttftMs,
-						PIIRedactedCount: piiRedacted,
-						Status:           statusCode,
-						CreatedAt:        startTime,
-					})
+					writeOpenAIError(w, statusCode, "gateway_error", errCode, errMsg)
+					h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, statusCode)
 					return
 				}
 
+				h.router.RecordLocalOutcome(router.OutcomeSuccess)
 				rawResp = aggData
 			} else {
 				// Local tier returned non-streaming JSON directly
@@ -847,26 +884,14 @@ func (h *Handler) handleNonStreaming(
 				decision.AcquiredLocal = false
 
 				if readErr != nil {
+					h.router.RecordLocalOutcome(router.OutcomeFailure)
 					log.Printf("[Proxy %s] Local read failed: %v", reqID, readErr)
-					clientName := "anonymous"
-					if client != nil && client.Name != "" {
-						clientName = client.Name
-					}
-					http.Error(w, fmt.Sprintf(`{"error": "local inference failed: %s"}`, readErr.Error()), http.StatusBadGateway)
-					h.audit.Log(&audit.Record{
-						RequestID:        reqID,
-						ClientName:       clientName,
-						RouteTarget:      finalTarget,
-						Model:            finalModel,
-						LatencyMs:        time.Since(startTime).Milliseconds(),
-						TTFTMs:           ttftMs,
-						PIIRedactedCount: piiRedacted,
-						Status:           http.StatusBadGateway,
-						CreatedAt:        startTime,
-					})
+					writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("local inference failed: %v", readErr))
+					h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, http.StatusBadGateway)
 					return
 				}
 
+				h.router.RecordLocalOutcome(router.OutcomeSuccess)
 				rawResp = append(firstChunk, remainder...)
 			}
 		}
@@ -874,47 +899,24 @@ func (h *Handler) handleNonStreaming(
 
 	// Route to Cloud if local not used or fallback triggered
 	if len(rawResp) == 0 {
-		clientName := "anonymous"
-		if client != nil && client.Name != "" {
-			clientName = client.Name
-		}
-
 		// D1 & R2.3: Check cloud quota in pre-WriteHeader window
-		if h.quotaMgr != nil {
-			status := h.quotaMgr.CheckAndIncrementCloud(clientName)
-			if status == quota.StatusLocalOnlyDisallowed {
-				// D3: daily_cloud_limit: -1 returns 503
-				http.Error(w, `{"error":{"message":"local tier unavailable and cloud fallback is disallowed for client","type":"service_unavailable_error","code":"cloud_fallback_disabled"}}`, http.StatusServiceUnavailable)
-				return
-			}
-			if status == quota.StatusQuotaExceeded {
-				http.Error(w, `{"error":{"message":"daily cloud fallback quota exceeded for client","type":"insufficient_quota","code":"daily_cloud_limit_exceeded"}}`, http.StatusTooManyRequests)
-				return
-			}
+		if !h.checkCloudQuota(w, clientName) {
+			return
 		}
 
 		rawResp, err = h.callCloudNonStreaming(r.Context(), req, finalModel)
 		if err != nil {
+			h.quotaMgr.RefundCloud(clientName)
 			log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
-			http.Error(w, fmt.Sprintf(`{"error": "inference tier failed: %s"}`, err.Error()), http.StatusBadGateway)
-			h.audit.Log(&audit.Record{
-				RequestID:        reqID,
-				ClientName:       clientName,
-				RouteTarget:      finalTarget,
-				Model:            finalModel,
-				LatencyMs:        time.Since(startTime).Milliseconds(),
-				TTFTMs:           0,
-				PIIRedactedCount: piiRedacted,
-				Status:           http.StatusBadGateway,
-				CreatedAt:        startTime,
-			})
+			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
+			h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, http.StatusBadGateway)
 			return
 		}
 	}
 
 	// 3. Contract Strict JSON Enforcement & Single Repair Loop
 	if strictJSON {
-		rawResp = h.enforceStrictJSON(r.Context(), reqID, finalTarget, finalModel, rawResp)
+		rawResp = h.enforceStrictJSON(r.Context(), reqID, clientName, finalTarget, finalModel, rawResp)
 	}
 
 	// 4. Rehydrate Vault Placeholders on the raw payload.
@@ -922,7 +924,6 @@ func (h *Handler) handleNonStreaming(
 	// reasoning_content and every vendor extension the upstream returned.
 	outBytes := RehydrateBody(vault, rawResp)
 
-	latencyMs := time.Since(startTime).Milliseconds()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-EdgeCat-Route", finalTarget)
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(outBytes)))
@@ -930,21 +931,7 @@ func (h *Handler) handleNonStreaming(
 	_, _ = w.Write(outBytes)
 
 	// Async SQLite audit
-	clientName := "anonymous"
-	if client != nil && client.Name != "" {
-		clientName = client.Name
-	}
-	h.audit.Log(&audit.Record{
-		RequestID:        reqID,
-		ClientName:       clientName,
-		RouteTarget:      finalTarget,
-		Model:            finalModel,
-		LatencyMs:        latencyMs,
-		TTFTMs:           0, // whole-body responses have no first-token latency
-		PIIRedactedCount: piiRedacted,
-		Status:           http.StatusOK,
-		CreatedAt:        startTime,
-	})
+	h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, http.StatusOK)
 }
 
 // enforceStrictJSON strips code fences from choices[0].message.content and
@@ -953,7 +940,7 @@ func (h *Handler) handleNonStreaming(
 // response fields survive the round trip.
 func (h *Handler) enforceStrictJSON(
 	ctx context.Context,
-	reqID, target, model string,
+	reqID, clientName, target, model string,
 	raw []byte,
 ) []byte {
 	obj, ok := decodeObject(raw)
@@ -966,7 +953,7 @@ func (h *Handler) enforceStrictJSON(
 	}
 
 	repaired, _, guardErr := h.guard.EnforceAndRepair(ctx, content, func(callCtx context.Context, broken string) (string, error) {
-		return h.invokeRepair(callCtx, target, model, broken)
+		return h.invokeRepair(callCtx, clientName, target, model, broken)
 	})
 	if guardErr != nil {
 		log.Printf("[Proxy %s] Strict JSON enforcement warning: %v", reqID, guardErr)
@@ -1061,7 +1048,7 @@ func (h *Handler) callCloudNonStreaming(
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("cloud returned status %d: %s", resp.StatusCode, string(body))
+		return nil, &upstreamStatusError{tier: "cloud", code: resp.StatusCode, body: string(body)}
 	}
 
 	return io.ReadAll(resp.Body)
@@ -1070,7 +1057,7 @@ func (h *Handler) callCloudNonStreaming(
 // invokeRepair executes a single repair prompt using the active inference tier.
 func (h *Handler) invokeRepair(
 	ctx context.Context,
-	target, model, broken string,
+	clientName, target, model, broken string,
 ) (string, error) {
 	repairReq := newRepairRequest(model, broken)
 
@@ -1079,7 +1066,15 @@ func (h *Handler) invokeRepair(
 	if target == router.TargetLocal {
 		data, err = h.callLocalNonStreaming(ctx, repairReq, model)
 	} else {
+		if h.quotaMgr != nil {
+			if status := h.quotaMgr.CheckAndIncrementCloud(clientName); status != quota.StatusAllowed {
+				return "", fmt.Errorf("cloud repair blocked by quota policy (%d)", status)
+			}
+		}
 		data, err = h.callCloudNonStreaming(ctx, repairReq, model)
+		if err != nil && h.quotaMgr != nil {
+			h.quotaMgr.RefundCloud(clientName)
+		}
 	}
 	if err != nil {
 		return "", err

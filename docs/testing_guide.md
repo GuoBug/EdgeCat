@@ -101,11 +101,12 @@ curl.exe -i -X OPTIONS http://127.0.0.1:8080/v1/chat/completions `
 - `Access-Control-Allow-Origin: https://patchcat.dev`
 - `Access-Control-Allow-Private-Network: true`
 
-### 3. Check `/health` Multi-Device Quota Summary
+### 3. Check `/health` Liveness & `/admin/status` Quota Summary
 ```powershell
 curl.exe -s http://127.0.0.1:8080/health
+curl.exe -s http://127.0.0.1:8080/admin/status
 ```
-**Expected**: Returns `clients_usage` showing today's cloud calls, limits, remaining quotas, and `next_quota_reset`.
+**Expected**: `/health` returns only minimal liveness `{"status":"healthy"}` without leaking internal endpoints or client quotas; `/admin/status` (requires Bearer token when `auth.enabled: true`) returns concurrency, circuit breaker state, `clients_usage`, and `next_quota_reset`.
 
 ---
 

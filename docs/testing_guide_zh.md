@@ -101,11 +101,12 @@ curl.exe -i -X OPTIONS http://127.0.0.1:8080/v1/chat/completions `
 - `Access-Control-Allow-Origin: https://patchcat.dev`
 - `Access-Control-Allow-Private-Network: true`
 
-### 3. 查看 `/health` 分账与配额视图
+### 3. 查看 `/health` 探活与 `/admin/status` 分账配额视图
 ```powershell
 curl.exe -s http://127.0.0.1:8080/health
+curl.exe -s http://127.0.0.1:8080/admin/status
 ```
-**期望结果**：JSON 返回中包含 `status: "healthy"`、并发信号量占用、`clients_usage`（各设备今日云端调用量与剩余额度）及 `next_quota_reset`。
+**期望结果**：`/health` 仅返回最小探活信息 `{"status":"healthy"}`（不泄露内部端点或客户端配额）；`/admin/status`（开启鉴权时需携带 Bearer Token）返回并发信号量占用、熔断器状态、`clients_usage`（各设备今日云端调用量与剩余额度）及 `next_quota_reset`。
 
 ---
 

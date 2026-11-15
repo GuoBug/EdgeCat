@@ -606,3 +606,201 @@ func TestProxy_Step3_Acceptance_NonStreaming_StrictJSON_ToolCallsPreserved(t *te
 		t.Fatalf("expected arguments %q, got %q", expectedArgs, fn["arguments"])
 	}
 }
+
+// Truncated local stream (EOF without [DONE] or finish_reason) must return 502, never synthesized 200.
+func TestProxy_LocalTruncatedStream_Returns502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-trunc\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"halfway\"}}]}\n\n"))
+		flusher.Flush()
+		// Close without finish_reason or [DONE]
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway for truncated stream, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_truncated") {
+		t.Fatalf("expected upstream_truncated error code, got: %s", rec.Body.String())
+	}
+}
+
+// In-band SSE error chunk from local backend must surface as 502 upstream_stream_error.
+func TestProxy_LocalInBandSSEError_Returns502(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"CUDA out of memory\"}}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 Bad Gateway, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CUDA out of memory") {
+		t.Fatalf("expected upstream error message, got: %s", rec.Body.String())
+	}
+}
+
+// Local stream aggregation injects stream_options.include_usage and preserves usage in final JSON.
+func TestProxy_LocalStreamAggregation_IncludesUsage(t *testing.T) {
+	var sawIncludeUsage bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"include_usage":true`) {
+			sawIncludeUsage = true
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-u\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-u\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = upstream.URL
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !sawIncludeUsage {
+		t.Fatal("expected stream_options.include_usage=true to be sent to local tier")
+	}
+	if !strings.Contains(rec.Body.String(), `"total_tokens":15`) {
+		t.Fatalf("expected usage to be preserved in aggregated response, got: %s", rec.Body.String())
+	}
+}
+
+// Streaming idle timeout emits an in-band SSE error event before closing.
+func TestProxy_StreamingIdleTimeout_EmitsSSEError(t *testing.T) {
+	localServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl-s\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n"))
+		flusher.Flush()
+		time.Sleep(150 * time.Millisecond)
+	}))
+	defer localServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = localServer.URL
+	cfg.Local.TTFTTimeoutMs = 100
+	cfg.Local.StreamIdleTimeoutMs = 40
+	h := newTestHandler(t, cfg)
+
+	rec := postChatCompletion(t, h, `{"model":"default","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 SSE header, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_idle_timeout") {
+		t.Fatalf("expected in-band upstream_idle_timeout SSE error, got: %s", rec.Body.String())
+	}
+}
+
+// Circuit breaker skips dead local tier after threshold failures without waiting TTFT.
+func TestProxy_CircuitBreaker_FastFallbackToCloud(t *testing.T) {
+	// Closed local server
+	deadLocal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	deadLocal.Close()
+
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-c","choices":[{"index":0,"message":{"role":"assistant","content":"cloud ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer cloudServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = deadLocal.URL
+	cfg.Local.TTFTTimeoutMs = 2000
+	cfg.Local.BreakerFailureThreshold = 2
+	cfg.Local.BreakerCooldownMs = 5000
+	cfg.Cloud.Endpoint = cloudServer.URL
+	h := newTestHandler(t, cfg)
+
+	for i := 0; i < 2; i++ {
+		rec := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+		if rec.Code != http.StatusOK || rec.Header().Get("X-EdgeCat-Route") != "cloud" {
+			t.Fatalf("call %d expected cloud fallback 200, got %d/%s", i+1, rec.Code, rec.Header().Get("X-EdgeCat-Route"))
+		}
+	}
+
+	start := time.Now()
+	rec3 := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	elapsed := time.Since(start)
+	if rec3.Code != http.StatusOK || rec3.Header().Get("X-EdgeCat-Route") != "cloud" {
+		t.Fatalf("call 3 expected fast cloud fallback, got %d", rec3.Code)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("expected open circuit fast-path < 100ms, took %v", elapsed)
+	}
+}
+
+// Cloud 5xx refunds quota, quoted upstream errors stay valid JSON, and cloud repair honors quota.
+func TestProxy_CloudQuotaRefund_And_ValidErrorJSON(t *testing.T) {
+	cloudCalls := 0
+	cloudServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cloudCalls++
+		switch cloudCalls {
+		case 1:
+			// 5xx with quotes in body -> must refund quota and return valid JSON error
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"bad \"quoted\" upstream"}`))
+		case 2:
+			// Returns malformed JSON so repair is triggered; quota (limit=1) is now exhausted for repair
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl-bad","choices":[{"index":0,"message":{"role":"assistant","content":"not json"},"finish_reason":"stop"}]}`))
+		default:
+			t.Fatalf("unexpected 3rd cloud call (repair should have been blocked by quota)")
+		}
+	}))
+	defer cloudServer.Close()
+
+	cfg := config.DefaultConfig()
+	cfg.Local.Endpoint = "" // direct cloud
+	cfg.Cloud.Endpoint = cloudServer.URL
+	cfg.Auth.Enabled = true
+	cfg.Auth.Clients = []config.ClientConfig{
+		{Name: "alice", Token: "tok-alice", DailyCloudLimit: 1},
+	}
+	h := newTestHandler(t, cfg)
+	headers := map[string]string{"Authorization": "Bearer tok-alice"}
+
+	// Call 1: cloud returns 500 -> client gets 502 with valid JSON, and quota is refunded
+	rec1 := postChatCompletion(t, h, `{"model":"default","stream":false,"messages":[{"role":"user","content":"hi"}]}`, headers)
+	if rec1.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", rec1.Code)
+	}
+	var errJSON map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &errJSON); err != nil {
+		t.Fatalf("expected valid JSON error body even with upstream quotes, got %q: %v", rec1.Body.String(), err)
+	}
+
+	// Call 2: quota was refunded, so alice still has 1 call left; repair is blocked by quota
+	rec2 := postChatCompletion(t, h, `{"model":"default","stream":false,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}`, headers)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 after quota refund, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if cloudCalls != 2 {
+		t.Fatalf("expected exactly 2 cloud calls (repair blocked by quota), got %d", cloudCalls)
+	}
+}

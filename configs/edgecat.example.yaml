@@ -41,6 +41,8 @@ local:
   max_concurrent_local: 2
   ttft_timeout_ms: 3500
   stream_idle_timeout_ms: 30000 # Idle timeout between chunks during generation (default 30s)
+  breaker_failure_threshold: 3  # Consecutive local failures before tripping circuit breaker
+  breaker_cooldown_ms: 30000    # Cooldown before admitting a half-open probe request
   model_mapping:
     "default": "qwen2.5:7b"
     "gpt-4o-mini": "qwen2.5:7b"

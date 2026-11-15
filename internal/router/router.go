@@ -24,6 +24,7 @@ type Decision struct {
 	Target        string // "local" or "cloud"
 	TargetModel   string
 	AcquiredLocal bool
+	IsProbe       bool
 	Reason        string
 }
 
@@ -33,6 +34,7 @@ type Router struct {
 	localSem      chan struct{}
 	localDisabled bool
 	localFallback atomic.Int64 // counter of fallbacks triggered
+	breaker       *breaker
 }
 
 // NewRouter initializes the router and concurrency semaphore.
@@ -48,6 +50,10 @@ func NewRouter(cfg *config.Config) *Router {
 		cfg:           cfg,
 		localSem:      make(chan struct{}, maxLocal),
 		localDisabled: disabled,
+		breaker: newBreaker(
+			cfg.Local.BreakerFailureThreshold,
+			time.Duration(cfg.Local.BreakerCooldownMs)*time.Millisecond,
+		),
 	}
 }
 
@@ -103,7 +109,7 @@ func (r *Router) MaxLocalConcurrency() int {
 	return cap(r.localSem)
 }
 
-// DecideRoute selects between Local Tier and Cloud Tier based on semaphore availability.
+// DecideRoute selects between Local Tier and Cloud Tier based on circuit breaker and semaphore availability.
 func (r *Router) DecideRoute(logicalModel string) Decision {
 	if r.localDisabled {
 		return Decision{
@@ -114,13 +120,29 @@ func (r *Router) DecideRoute(logicalModel string) Decision {
 		}
 	}
 
+	allowed, isProbe := r.breaker.allow()
+	if !allowed {
+		r.localFallback.Add(1)
+		return Decision{
+			Target:        TargetCloud,
+			TargetModel:   r.ResolveModel(TargetCloud, logicalModel),
+			AcquiredLocal: false,
+			Reason:        "local_circuit_open",
+		}
+	}
+
 	if r.TryAcquireLocal() {
 		return Decision{
 			Target:        TargetLocal,
 			TargetModel:   r.ResolveModel(TargetLocal, logicalModel),
 			AcquiredLocal: true,
+			IsProbe:       isProbe,
 			Reason:        "local_semaphore_acquired",
 		}
+	}
+
+	if isProbe {
+		r.breaker.cancelProbe()
 	}
 
 	// Concurrency saturated -> Fallback to Cloud immediately
@@ -131,6 +153,21 @@ func (r *Router) DecideRoute(logicalModel string) Decision {
 		AcquiredLocal: false,
 		Reason:        "local_concurrency_saturated",
 	}
+}
+
+// RecordLocalOutcome updates the local circuit breaker based on an attempt's result.
+func (r *Router) RecordLocalOutcome(outcome Outcome) {
+	if r.breaker != nil {
+		r.breaker.record(outcome)
+	}
+}
+
+// BreakerState returns the current circuit breaker state and consecutive failure count.
+func (r *Router) BreakerState() (string, int) {
+	if r.breaker == nil {
+		return BreakerClosed, 0
+	}
+	return r.breaker.snapshot()
 }
 
 // LocalEndpoint returns the URL of the local tier endpoint.
