@@ -17,6 +17,7 @@ import (
 // adjacent SSE JSON frames are completely restored.
 type StreamRehydrator struct {
 	vault                *filter.Vault
+	blockAPIKeyTool      bool
 	contentRehydrators   map[int]*filter.SlidingRehydrator
 	reasoningRehydrators map[int]*filter.SlidingRehydrator
 	toolCallRehydrators  map[int]map[int]*filter.SlidingRehydrator
@@ -26,8 +27,14 @@ type StreamRehydrator struct {
 
 // NewStreamRehydrator initializes a stream rehydrator attached to the request vault.
 func NewStreamRehydrator(vault *filter.Vault) *StreamRehydrator {
+	return NewStreamRehydratorWithOptions(vault, false)
+}
+
+// NewStreamRehydratorWithOptions initializes a stream rehydrator with tool-call APIKEY protection.
+func NewStreamRehydratorWithOptions(vault *filter.Vault, blockAPIKeyTool bool) *StreamRehydrator {
 	return &StreamRehydrator{
 		vault:                vault,
+		blockAPIKeyTool:      blockAPIKeyTool,
 		contentRehydrators:   make(map[int]*filter.SlidingRehydrator),
 		reasoningRehydrators: make(map[int]*filter.SlidingRehydrator),
 		toolCallRehydrators:  make(map[int]map[int]*filter.SlidingRehydrator),
@@ -60,7 +67,11 @@ func (s *StreamRehydrator) getToolCallRehydrator(choiceIdx, toolIdx int) *filter
 	}
 	r, ok := choiceMap[toolIdx]
 	if !ok {
-		r = filter.NewSlidingRehydrator(s.vault)
+		if s.blockAPIKeyTool {
+			r = filter.NewSlidingRehydratorExcludingAPIKey(s.vault)
+		} else {
+			r = filter.NewSlidingRehydrator(s.vault)
+		}
 		choiceMap[toolIdx] = r
 	}
 	return r

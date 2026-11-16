@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+var reEnvRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // Config represents the complete gateway runtime configuration.
 type Config struct {
@@ -52,6 +55,8 @@ type ClientConfig struct {
 	Name            string `yaml:"name" json:"name"`
 	Token           string `yaml:"token" json:"token"`
 	DailyCloudLimit int    `yaml:"daily_cloud_limit" json:"daily_cloud_limit"` // 0: unlimited, -1: local only, >0: max daily cloud calls
+	PIIPolicy       string `yaml:"pii_policy" json:"pii_policy"`               // optional override: mask_always, mask_on_egress, local_only, block
+	QueueWaitMs     int    `yaml:"queue_wait_ms" json:"queue_wait_ms"`         // optional override for local semaphore wait
 }
 
 // LocalConfig configures the local inference tier (e.g., Ollama / vLLM / llama.cpp).
@@ -59,6 +64,7 @@ type LocalConfig struct {
 	Endpoint                string            `yaml:"endpoint" json:"endpoint"`
 	APIKey                  string            `yaml:"api_key" json:"api_key"`
 	MaxConcurrentLocal      int               `yaml:"max_concurrent_local" json:"max_concurrent_local"`
+	QueueWaitMs             int               `yaml:"queue_wait_ms" json:"queue_wait_ms"`
 	TTFTTimeoutMs           int               `yaml:"ttft_timeout_ms" json:"ttft_timeout_ms"`
 	StreamIdleTimeoutMs     int               `yaml:"stream_idle_timeout_ms" json:"stream_idle_timeout_ms"`
 	BreakerFailureThreshold int               `yaml:"breaker_failure_threshold" json:"breaker_failure_threshold"`
@@ -76,11 +82,15 @@ type CloudConfig struct {
 
 // FilterConfig configures the PII detection and masking rules.
 type FilterConfig struct {
-	Enabled    bool `yaml:"enabled" json:"enabled"`
-	MaskPhone  bool `yaml:"mask_phone" json:"mask_phone"`
-	MaskEmail  bool `yaml:"mask_email" json:"mask_email"`
-	MaskIPv4   bool `yaml:"mask_ipv4" json:"mask_ipv4"`
-	MaskAPIKey bool `yaml:"mask_apikey" json:"mask_apikey"`
+	Enabled                  bool   `yaml:"enabled" json:"enabled"`
+	Policy                   string `yaml:"policy" json:"policy"` // mask_always (default), mask_on_egress, local_only, block
+	MaskPhone                bool   `yaml:"mask_phone" json:"mask_phone"`
+	MaskEmail                bool   `yaml:"mask_email" json:"mask_email"`
+	MaskIPv4                 bool   `yaml:"mask_ipv4" json:"mask_ipv4"`
+	MaskAPIKey               bool   `yaml:"mask_apikey" json:"mask_apikey"`
+	MaskIDCard               bool   `yaml:"mask_idcard" json:"mask_idcard"`
+	MaskBankCard             bool   `yaml:"mask_bankcard" json:"mask_bankcard"`
+	BlockAPIKeyToolRehydrate bool   `yaml:"block_apikey_tool_rehydrate" json:"block_apikey_tool_rehydrate"`
 }
 
 // ContractConfig configures response contract validation and JSON guard.
@@ -138,11 +148,15 @@ func DefaultConfig() *Config {
 			},
 		},
 		Filter: FilterConfig{
-			Enabled:    true,
-			MaskPhone:  true,
-			MaskEmail:  true,
-			MaskIPv4:   true,
-			MaskAPIKey: true,
+			Enabled:                  true,
+			Policy:                   "mask_always",
+			MaskPhone:                true,
+			MaskEmail:                true,
+			MaskIPv4:                 true,
+			MaskAPIKey:               true,
+			MaskIDCard:               false,
+			MaskBankCard:             false,
+			BlockAPIKeyToolRehydrate: true,
 		},
 		Contract: ContractConfig{
 			StrictJSONEnabled: true,
@@ -181,10 +195,36 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	applySanityChecks(cfg)
+	expandEnvRefs(cfg)
 	if err := Validate(cfg); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 	return cfg, nil
+}
+
+func expandEnvRefs(cfg *Config) {
+	expand := func(s string) string {
+		return reEnvRef.ReplaceAllStringFunc(s, func(match string) string {
+			sub := reEnvRef.FindStringSubmatch(match)
+			if len(sub) == 2 {
+				if val, ok := os.LookupEnv(sub[1]); ok {
+					return val
+				}
+			}
+			return match
+		})
+	}
+	cfg.Local.APIKey = expand(cfg.Local.APIKey)
+	cfg.Cloud.APIKey = expand(cfg.Cloud.APIKey)
+}
+
+func isValidPIIPolicy(p string) bool {
+	switch p {
+	case "", "mask_always", "mask_on_egress", "local_only", "block":
+		return true
+	default:
+		return false
+	}
 }
 
 // IsLoopbackHost checks whether a host is a local loopback interface.
@@ -217,7 +257,14 @@ func Validate(cfg *Config) error {
 			if strings.TrimSpace(c.Token) == "" {
 				return fmt.Errorf("auth.clients[%d] token cannot be empty when auth is enabled", i)
 			}
+			if !isValidPIIPolicy(c.PIIPolicy) {
+				return fmt.Errorf("auth.clients[%d] invalid pii_policy %q", i, c.PIIPolicy)
+			}
 		}
+	}
+
+	if !isValidPIIPolicy(cfg.Filter.Policy) {
+		return fmt.Errorf("filter.policy invalid value %q", cfg.Filter.Policy)
 	}
 
 	return nil
@@ -247,6 +294,9 @@ func applySanityChecks(cfg *Config) {
 	}
 	if cfg.Local.BreakerCooldownMs <= 0 {
 		cfg.Local.BreakerCooldownMs = 30000
+	}
+	if cfg.Filter.Policy == "" {
+		cfg.Filter.Policy = "mask_always"
 	}
 	if cfg.Contract.MaxRepairAttempts < 0 {
 		cfg.Contract.MaxRepairAttempts = 0

@@ -7,6 +7,7 @@
 package router
 
 import (
+	"context"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -78,8 +79,14 @@ func (r *Router) ResolveModel(target, logicalModel string) string {
 	return logicalModel
 }
 
-// TryAcquireLocal attempts to acquire a concurrency slot for the local inference tier.
+// TryAcquireLocal attempts to acquire a concurrency slot for the local inference tier without waiting.
 func (r *Router) TryAcquireLocal() bool {
+	return r.AcquireLocal(context.Background(), 0)
+}
+
+// AcquireLocal attempts to acquire a concurrency slot for the local inference tier,
+// optionally waiting up to wait duration before returning false.
+func (r *Router) AcquireLocal(ctx context.Context, wait time.Duration) bool {
 	if r.localDisabled {
 		return false
 	}
@@ -87,6 +94,18 @@ func (r *Router) TryAcquireLocal() bool {
 	case r.localSem <- struct{}{}:
 		return true
 	default:
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case r.localSem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -109,8 +128,14 @@ func (r *Router) MaxLocalConcurrency() int {
 	return cap(r.localSem)
 }
 
-// DecideRoute selects between Local Tier and Cloud Tier based on circuit breaker and semaphore availability.
+// DecideRoute selects between Local Tier and Cloud Tier using default queue wait.
 func (r *Router) DecideRoute(logicalModel string) Decision {
+	return r.DecideRouteWithContext(context.Background(), logicalModel, 0)
+}
+
+// DecideRouteWithContext selects between Local Tier and Cloud Tier based on
+// circuit breaker, semaphore availability, and optional queue_wait_ms budget.
+func (r *Router) DecideRouteWithContext(ctx context.Context, logicalModel string, waitOverrideMs int) Decision {
 	if r.localDisabled {
 		return Decision{
 			Target:        TargetCloud,
@@ -131,7 +156,15 @@ func (r *Router) DecideRoute(logicalModel string) Decision {
 		}
 	}
 
-	if r.TryAcquireLocal() {
+	waitMs := r.cfg.Local.QueueWaitMs
+	if waitOverrideMs > 0 {
+		waitMs = waitOverrideMs
+	}
+	if isProbe {
+		waitMs = 0
+	}
+
+	if r.AcquireLocal(ctx, time.Duration(waitMs)*time.Millisecond) {
 		return Decision{
 			Target:        TargetLocal,
 			TargetModel:   r.ResolveModel(TargetLocal, logicalModel),

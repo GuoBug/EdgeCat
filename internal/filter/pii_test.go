@@ -227,3 +227,33 @@ func TestMasker_PhoneFormats(t *testing.T) {
 		}
 	}
 }
+
+func TestMasker_IDCard_BankCard_And_APIKeyToolGuard(t *testing.T) {
+	masker := filter.NewMaskerFromRules(false, false, false, true, true, true)
+	vault := filter.NewVault()
+
+	// Valid 18-digit ID card + valid Luhn 16-digit card (4111111111111111) + non-Luhn 16-digit number + API key
+	input := "ID: 11010519900307123X, Card: 4111111111111111, Order: 1234567890123456, Key: sk-live-0123456789abcdef0123456789"
+	if !masker.ContainsPII(input) {
+		t.Fatal("expected ContainsPII to detect sensitive tokens")
+	}
+	masked := masker.MaskText(input, vault)
+	if !strings.Contains(masked, "{{EC_PII_IDCARD_1}}") {
+		t.Fatalf("expected IDCARD placeholder, got %s", masked)
+	}
+	if !strings.Contains(masked, "{{EC_PII_BANKCARD_1}}") {
+		t.Fatalf("expected Luhn-valid BANKCARD placeholder, got %s", masked)
+	}
+	if !strings.Contains(masked, "1234567890123456") {
+		t.Fatalf("expected non-Luhn order number to remain unmasked, got %s", masked)
+	}
+
+	// RehydrateExcludingAPIKey must restore IDCARD/BANKCARD but keep APIKEY redacted
+	safeToolArgs := vault.RehydrateExcludingAPIKey(masked)
+	if !strings.Contains(safeToolArgs, "11010519900307123X") || !strings.Contains(safeToolArgs, "4111111111111111") {
+		t.Fatalf("expected IDCARD and BANKCARD restored, got %s", safeToolArgs)
+	}
+	if strings.Contains(safeToolArgs, "sk-live-") || !strings.Contains(safeToolArgs, "{{EC_PII_APIKEY_1}}") {
+		t.Fatalf("expected APIKEY to stay redacted in tool args, got %s", safeToolArgs)
+	}
+}

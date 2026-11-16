@@ -299,21 +299,58 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// 1. PII Masking and Request Vault
-	vault := filter.NewVault()
-	if h.cfg.Filter.Enabled && h.masker != nil {
-		MaskRequestContent(req, h.masker, vault)
+	clientName := "anonymous"
+	piiPolicy := h.cfg.Filter.Policy
+	queueWaitMs := h.cfg.Local.QueueWaitMs
+	if client != nil {
+		clientName = clientNameOf(client.Name)
+		if client.PIIPolicy != "" {
+			piiPolicy = client.PIIPolicy
+		}
+		if client.QueueWaitMs > 0 {
+			queueWaitMs = client.QueueWaitMs
+		}
 	}
-	piiRedacted := vault.RedactedCount()
+	if piiPolicy == "" {
+		piiPolicy = "mask_always"
+	}
 
-	// 2. Routing and concurrency admission
-	decision := h.router.DecideRoute(req.Model())
+	// 1. PII Policy Evaluation & Eager Masking (when policy == mask_always)
+	vault := filter.NewVault()
+	localOnly := false
+	if h.cfg.Filter.Enabled && h.masker != nil {
+		switch piiPolicy {
+		case "block":
+			if RequestContainsPII(req, h.masker) {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "pii_blocked", "request contains sensitive PII blocked by policy")
+				h.recordAudit(requestID, clientName, "blocked", req.Model(), startTime, 0, 0, http.StatusBadRequest)
+				return
+			}
+		case "local_only":
+			if RequestContainsPII(req, h.masker) {
+				localOnly = true
+			}
+		case "mask_on_egress":
+			// Defer masking until dispatch confirms cloud routing/fallback.
+		default: // "mask_always"
+			MaskRequestContent(req, h.masker, vault)
+		}
+	}
+
+	// 2. Routing and concurrency admission (with optional queue_wait_ms)
+	decision := h.router.DecideRouteWithContext(r.Context(), req.Model(), queueWaitMs)
 	defer func() {
 		if decision.AcquiredLocal {
 			h.router.ReleaseLocal()
 			decision.AcquiredLocal = false
 		}
 	}()
+
+	if localOnly && !decision.AcquiredLocal {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "service_unavailable_error", "pii_local_only_unavailable", "request contains PII restricted to local inference, and local tier is unavailable")
+		h.recordAudit(requestID, clientName, router.TargetLocal, req.Model(), startTime, 0, 0, http.StatusServiceUnavailable)
+		return
+	}
 
 	// 3. Strict JSON contract opt-in.
 	// contract.strict_json_enabled is the master switch; the client may then ask
@@ -322,15 +359,10 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	// README: streaming keeps its first-token latency instead).
 	strictJSON := h.guard.StrictJSONEnabled && clientWantsStrictJSON(r, req)
 
-	clientName := "anonymous"
-	if client != nil {
-		clientName = clientNameOf(client.Name)
-	}
-
 	if req.Stream() {
-		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, clientName)
+		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, clientName, piiPolicy, localOnly)
 	} else {
-		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, piiRedacted, strictJSON, clientName)
+		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, strictJSON, clientName, piiPolicy, localOnly)
 	}
 }
 
@@ -384,37 +416,42 @@ func clientWantsStrictJSON(r *http.Request, req *Request) bool {
 	if strings.EqualFold(r.Header.Get("X-EdgeCat-Strict-JSON"), "true") {
 		return true
 	}
-	return req.ResponseFormatType() == "json_object"
+	rf := req.ResponseFormatType()
+	return rf == "json_object" || rf == "json_schema"
 }
 
 type dispatchResult struct {
-	target     string
-	model      string
-	ttftMs     int64
-	usingLocal bool
-	resp       *http.Response
-	firstChunk []byte
-	cancel     context.CancelFunc
-	rawBody    []byte
-	handled    bool
+	target      string
+	model       string
+	ttftMs      int64
+	piiRedacted int
+	usingLocal  bool
+	resp        *http.Response
+	firstChunk  []byte
+	cancel      context.CancelFunc
+	rawBody     []byte
+	handled     bool
 }
 
-// dispatch executes the local-first admission, TTFT fallback, cloud quota check,
-// and upstream invocation shared by streaming and non-streaming paths.
+// dispatch executes the local-first admission, TTFT fallback, egress PII masking,
+// cloud quota check, and upstream invocation shared by streaming and non-streaming paths.
 func (h *Handler) dispatch(
 	w http.ResponseWriter,
 	r *http.Request,
 	reqID string,
 	req *Request,
 	decision *router.Decision,
+	vault *filter.Vault,
 	startTime time.Time,
-	piiRedacted int,
 	clientName string,
+	piiPolicy string,
+	localOnly bool,
 	forceLocalStream bool,
 ) dispatchResult {
 	res := dispatchResult{
-		target: decision.Target,
-		model:  decision.TargetModel,
+		target:      decision.Target,
+		model:       decision.TargetModel,
+		piiRedacted: vault.RedactedCount(),
 	}
 
 	if decision.AcquiredLocal {
@@ -454,7 +491,15 @@ func (h *Handler) dispatch(
 		decision.AcquiredLocal = false
 
 		if outcome == router.OutcomeNeutral {
-			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, StatusClientClosedRequest)
+			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, res.piiRedacted, StatusClientClosedRequest)
+			res.handled = true
+			return res
+		}
+
+		if localOnly {
+			log.Printf("[Proxy %s] Local failed (%v) and PII policy is local_only; blocking cloud fallback.", reqID, err)
+			writeOpenAIError(w, http.StatusServiceUnavailable, "service_unavailable_error", "pii_local_only_unavailable", "local inference failed and PII local_only policy forbids cloud fallback")
+			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, res.piiRedacted, http.StatusServiceUnavailable)
 			res.handled = true
 			return res
 		}
@@ -463,6 +508,12 @@ func (h *Handler) dispatch(
 		h.router.RecordFallback()
 		res.target = router.TargetCloud
 		res.model = h.router.ResolveModel(router.TargetCloud, req.Model())
+	}
+
+	// Apply egress masking only when routing/falling back to cloud under mask_on_egress.
+	if piiPolicy == "mask_on_egress" && h.cfg.Filter.Enabled && h.masker != nil {
+		MaskRequestContent(req, h.masker, vault)
+		res.piiRedacted = vault.RedactedCount()
 	}
 
 	if !h.checkCloudQuota(w, clientName) {
@@ -476,7 +527,7 @@ func (h *Handler) dispatch(
 			h.quotaMgr.RefundCloud(clientName)
 			log.Printf("[Proxy %s] Cloud streaming error: %v", reqID, err)
 			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
-			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, http.StatusBadGateway)
+			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, res.piiRedacted, http.StatusBadGateway)
 			res.handled = true
 			return res
 		}
@@ -489,7 +540,7 @@ func (h *Handler) dispatch(
 		h.quotaMgr.RefundCloud(clientName)
 		log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
 		writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
-		h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, http.StatusBadGateway)
+		h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, res.piiRedacted, http.StatusBadGateway)
 		res.handled = true
 		return res
 	}
@@ -505,8 +556,9 @@ func (h *Handler) handleStreaming(
 	decision router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
-	piiRedacted int,
 	clientName string,
+	piiPolicy string,
+	localOnly bool,
 ) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -520,7 +572,7 @@ func (h *Handler) handleStreaming(
 	// rolling idle deadline that is refreshed on every successful flush.
 	touchDeadline := newStreamDeadlineRefresher(w, h.cfg.Server.StreamIdleTimeoutMs)
 
-	res := h.dispatch(w, r, reqID, req, &decision, startTime, piiRedacted, clientName, false)
+	res := h.dispatch(w, r, reqID, req, &decision, vault, startTime, clientName, piiPolicy, localOnly, false)
 	if res.handled {
 		return
 	}
@@ -532,6 +584,7 @@ func (h *Handler) handleStreaming(
 	finalTarget := res.target
 	finalModel := res.model
 	ttftMs := res.ttftMs
+	piiRedacted := res.piiRedacted
 	firstChunk := res.firstChunk
 	usingLocal := res.usingLocal
 	upstreamResp := res.resp
@@ -545,7 +598,7 @@ func (h *Handler) handleStreaming(
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	streamRehydrator := NewStreamRehydrator(vault)
+	streamRehydrator := NewStreamRehydratorWithOptions(vault, h.cfg.Filter.BlockAPIKeyToolRehydrate)
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), upstreamResp.Body))
 
 	idleTimeout := h.router.LocalStreamIdleTimeout()
@@ -843,14 +896,15 @@ func (h *Handler) handleNonStreaming(
 	decision router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
-	piiRedacted int,
 	strictJSON bool,
 	clientName string,
+	piiPolicy string,
+	localOnly bool,
 ) {
 	// Even though the client requested a non-streaming response, calling local with
 	// stream:true lets us reuse the strict TTFT cutoff, while allowing healthy long
 	// generations to proceed without timing out arbitrarily.
-	res := h.dispatch(w, r, reqID, req, &decision, startTime, piiRedacted, clientName, true)
+	res := h.dispatch(w, r, reqID, req, &decision, vault, startTime, clientName, piiPolicy, localOnly, true)
 	if res.handled {
 		return
 	}
@@ -858,6 +912,7 @@ func (h *Handler) handleNonStreaming(
 	finalTarget := res.target
 	finalModel := res.model
 	ttftMs := res.ttftMs
+	piiRedacted := res.piiRedacted
 	rawResp := res.rawBody
 
 	if res.usingLocal {
@@ -941,7 +996,7 @@ func (h *Handler) handleNonStreaming(
 	// 4. Rehydrate Vault Placeholders on the raw payload.
 	// Re-encoding through typed structs here would silently strip tool_calls,
 	// reasoning_content and every vendor extension the upstream returned.
-	outBytes := RehydrateBody(vault, rawResp)
+	outBytes := RehydrateBodySafe(vault, rawResp, h.cfg.Filter.BlockAPIKeyToolRehydrate)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-EdgeCat-Route", finalTarget)

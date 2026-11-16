@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/patchcat-dev/edgecat/internal/config"
@@ -87,5 +89,38 @@ func TestValidate_FailClosedLANGuard(t *testing.T) {
 				t.Fatalf("unexpected validation error: %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadConfig_EnvExpansionAndPIIPolicyValidation(t *testing.T) {
+	t.Setenv("EDGECAT_TEST_CLOUD_KEY", "sk-from-env-123456")
+	cfgPath := filepath.Join(t.TempDir(), "edgecat.yaml")
+	yamlBody := `
+server:
+  host: "127.0.0.1"
+cloud:
+  api_key: "${EDGECAT_TEST_CLOUD_KEY}"
+filter:
+  enabled: true
+  policy: "mask_on_egress"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("expected valid config, got %v", err)
+	}
+	if cfg.Cloud.APIKey != "sk-from-env-123456" {
+		t.Fatalf("expected env expanded api_key, got %q", cfg.Cloud.APIKey)
+	}
+	if cfg.Filter.Policy != "mask_on_egress" {
+		t.Fatalf("expected mask_on_egress, got %q", cfg.Filter.Policy)
+	}
+
+	// Invalid policy must fail validation
+	cfg.Filter.Policy = "invalid_policy"
+	if err := config.Validate(cfg); err == nil {
+		t.Fatal("expected validation error for invalid filter.policy")
 	}
 }

@@ -39,6 +39,7 @@ local:
   endpoint: "http://127.0.0.1:11434/v1"
   api_key: ""
   max_concurrent_local: 2
+  queue_wait_ms: 0              # Optional wait budget (ms) when local slots are full before cloud fallback
   ttft_timeout_ms: 3500
   stream_idle_timeout_ms: 30000 # Idle timeout between chunks during generation (default 30s)
   breaker_failure_threshold: 3  # Consecutive local failures before tripping circuit breaker
@@ -58,10 +59,14 @@ cloud:
 
 filter:
   enabled: true
+  policy: "mask_always"         # mask_always | mask_on_egress | local_only | block
   mask_phone: true
   mask_email: true
   mask_ipv4: true
   mask_apikey: true
+  mask_idcard: false
+  mask_bankcard: false
+  block_apikey_tool_rehydrate: true
 
 contract:
   strict_json_enabled: true

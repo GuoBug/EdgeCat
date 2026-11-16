@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/patchcat-dev/edgecat/internal/filter"
 )
@@ -154,6 +155,51 @@ func maskContentValue(content any, masker *filter.Masker, vault *filter.Vault) a
 	}
 }
 
+// RequestContainsPII reports whether any textual message or tool argument matches an enabled PII rule.
+func RequestContainsPII(req *Request, masker *filter.Masker) bool {
+	if req == nil || masker == nil {
+		return false
+	}
+	for _, raw := range req.Messages() {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if content, exists := msg["content"]; exists {
+			switch value := content.(type) {
+			case string:
+				if masker.ContainsPII(value) {
+					return true
+				}
+			case []any:
+				for _, rawPart := range value {
+					part, ok := rawPart.(map[string]any)
+					if !ok || part["type"] != "text" {
+						continue
+					}
+					if text, ok := part["text"].(string); ok && masker.ContainsPII(text) {
+						return true
+					}
+				}
+			}
+		}
+		if toolCalls, ok := msg["tool_calls"].([]any); ok {
+			for _, rawCall := range toolCalls {
+				call, ok := rawCall.(map[string]any)
+				if !ok {
+					continue
+				}
+				if fn, ok := call["function"].(map[string]any); ok {
+					if args, ok := fn["arguments"].(string); ok && masker.ContainsPII(args) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // RehydrateBody restores PII placeholders inside a raw JSON payload without
 // re-encoding it.
 //
@@ -167,6 +213,57 @@ func RehydrateBody(vault *filter.Vault, raw []byte) []byte {
 		return raw
 	}
 	return []byte(vault.Rehydrate(string(raw)))
+}
+
+// RehydrateBodySafe restores PII placeholders in raw JSON while optionally keeping
+// APIKEY placeholders redacted inside tool_calls[].function.arguments.
+func RehydrateBodySafe(vault *filter.Vault, raw []byte, blockAPIKeyInToolCalls bool) []byte {
+	if vault == nil || len(raw) == 0 || vault.RedactedCount() == 0 {
+		return raw
+	}
+	s := string(raw)
+	if !blockAPIKeyInToolCalls || !strings.Contains(s, filter.PlaceholderPrefix+filter.TypeAPIKey+"_") {
+		return []byte(vault.Rehydrate(s))
+	}
+	obj, ok := decodeObject(raw)
+	if !ok {
+		return []byte(vault.RehydrateExcludingAPIKey(s))
+	}
+	if choices, ok := obj["choices"].([]any); ok {
+		for _, rc := range choices {
+			choice, ok := rc.(map[string]any)
+			if !ok {
+				continue
+			}
+			msg, ok := choice["message"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if content, ok := msg["content"].(string); ok {
+				msg["content"] = vault.Rehydrate(content)
+			}
+			if reasoning, ok := msg["reasoning_content"].(string); ok {
+				msg["reasoning_content"] = vault.Rehydrate(reasoning)
+			}
+			if toolCalls, ok := msg["tool_calls"].([]any); ok {
+				for _, rt := range toolCalls {
+					tc, ok := rt.(map[string]any)
+					if !ok {
+						continue
+					}
+					if fn, ok := tc["function"].(map[string]any); ok {
+						if args, ok := fn["arguments"].(string); ok {
+							fn["arguments"] = vault.RehydrateExcludingAPIKey(args)
+						}
+					}
+				}
+			}
+		}
+	}
+	if out, err := marshalObject(obj); err == nil {
+		return out
+	}
+	return []byte(vault.RehydrateExcludingAPIKey(s))
 }
 
 // decodeObject decodes a JSON object preserving numeric literals.

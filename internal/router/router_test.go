@@ -6,7 +6,9 @@
 package router_test
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/patchcat-dev/edgecat/internal/config"
 	"github.com/patchcat-dev/edgecat/internal/router"
@@ -70,4 +72,27 @@ func TestRouter_SemaphoreSaturationFallback(t *testing.T) {
 	if d4.Target != router.TargetLocal || !d4.AcquiredLocal {
 		t.Fatalf("expected d4 to acquire local after release, got %+v", d4)
 	}
+}
+
+func TestRouter_QueueWaitAcquiresReleasedSlot(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Local.MaxConcurrentLocal = 1
+	cfg.Local.QueueWaitMs = 150
+	r := router.NewRouter(cfg)
+
+	d1 := r.DecideRouteWithContext(context.Background(), "default", 0)
+	if !d1.AcquiredLocal {
+		t.Fatalf("expected d1 to acquire local")
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		r.ReleaseLocal()
+	}()
+
+	d2 := r.DecideRouteWithContext(context.Background(), "default", 0)
+	if d2.Target != router.TargetLocal || !d2.AcquiredLocal {
+		t.Fatalf("expected d2 to wait and acquire local slot, got %+v", d2)
+	}
+	r.ReleaseLocal()
 }

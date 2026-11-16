@@ -69,14 +69,16 @@ func main() {
 	}()
 
 	// 3. Initialize PII filter and Masker
-	masker := filter.NewMasker(
+	masker := filter.NewMaskerFromRules(
 		cfg.Filter.MaskPhone,
 		cfg.Filter.MaskEmail,
 		cfg.Filter.MaskIPv4,
 		cfg.Filter.MaskAPIKey,
+		cfg.Filter.MaskIDCard,
+		cfg.Filter.MaskBankCard,
 	)
-	log.Printf("[Init] PII filter enabled: %v (Phone: %v, Email: %v, IPv4: %v, APIKey: %v)",
-		cfg.Filter.Enabled, cfg.Filter.MaskPhone, cfg.Filter.MaskEmail, cfg.Filter.MaskIPv4, cfg.Filter.MaskAPIKey)
+	log.Printf("[Init] PII filter enabled: %v (Policy: %s, Phone: %v, Email: %v, IPv4: %v, APIKey: %v, IDCard: %v, BankCard: %v)",
+		cfg.Filter.Enabled, cfg.Filter.Policy, cfg.Filter.MaskPhone, cfg.Filter.MaskEmail, cfg.Filter.MaskIPv4, cfg.Filter.MaskAPIKey, cfg.Filter.MaskIDCard, cfg.Filter.MaskBankCard)
 
 	// 4. Initialize Router with concurrency semaphore and TTFT fallback
 	r := router.NewRouter(cfg)

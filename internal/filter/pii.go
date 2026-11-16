@@ -20,10 +20,12 @@ const vaultContextKey contextKey = "edgecat_pii_vault"
 
 // Standard PII types supported by EdgeCat.
 const (
-	TypePhone  = "PHONE"
-	TypeEmail  = "EMAIL"
-	TypeIPv4   = "IPV4"
-	TypeAPIKey = "APIKEY"
+	TypePhone    = "PHONE"
+	TypeEmail    = "EMAIL"
+	TypeIPv4     = "IPV4"
+	TypeAPIKey   = "APIKEY"
+	TypeIDCard   = "IDCARD"
+	TypeBankCard = "BANKCARD"
 )
 
 const (
@@ -47,6 +49,12 @@ var (
 
 	// Common API Keys / Secret tokens (OpenAI, GitHub, Bearer tokens)
 	reAPIKey = regexp.MustCompile(`\b(?:sk|sk-proj|ghp|gho|pat|glpat|xoxb|xoxp)-[A-Za-z0-9_\-]{20,}\b`)
+
+	// Chinese 18-digit Resident ID Card
+	reIDCard = regexp.MustCompile(`\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx]\b`)
+
+	// Bank card numbers (16-19 digits, validated with Luhn checksum)
+	reBankCard = regexp.MustCompile(`\b[1-9]\d{15,18}\b`)
 )
 
 // Vault stores deterministic mappings between sensitive values and placeholders for a request.
@@ -97,6 +105,16 @@ func (v *Vault) Lookup(placeholder string) (string, bool) {
 
 // Rehydrate replaces all known placeholders in text with their original values.
 func (v *Vault) Rehydrate(text string) string {
+	return v.rehydrate(text, false)
+}
+
+// RehydrateExcludingAPIKey restores all placeholders except APIKEY placeholders,
+// preventing indirect prompt injection from exfiltrating API keys via tool arguments.
+func (v *Vault) RehydrateExcludingAPIKey(text string) string {
+	return v.rehydrate(text, true)
+}
+
+func (v *Vault) rehydrate(text string, skipAPIKey bool) string {
 	if text == "" {
 		return text
 	}
@@ -108,6 +126,9 @@ func (v *Vault) Rehydrate(text string) string {
 	}
 
 	return rePlaceholder.ReplaceAllStringFunc(text, func(ph string) string {
+		if skipAPIKey && strings.HasPrefix(ph, PlaceholderPrefix+TypeAPIKey+"_") {
+			return ph
+		}
 		if original, exists := v.reverse[ph]; exists {
 			return original
 		}
@@ -147,13 +168,15 @@ func VaultFromContext(ctx context.Context) *Vault {
 
 // Masker detects and masks sensitive PII in text content using a Vault.
 type Masker struct {
-	MaskPhone  bool
-	MaskEmail  bool
-	MaskIPv4   bool
-	MaskAPIKey bool
+	MaskPhone    bool
+	MaskEmail    bool
+	MaskIPv4     bool
+	MaskAPIKey   bool
+	MaskIDCard   bool
+	MaskBankCard bool
 }
 
-// NewMasker creates a Masker with specified rule flags.
+// NewMasker creates a Masker with the core 4 rule flags.
 func NewMasker(phone, email, ipv4, apiKey bool) *Masker {
 	return &Masker{
 		MaskPhone:  phone,
@@ -161,6 +184,48 @@ func NewMasker(phone, email, ipv4, apiKey bool) *Masker {
 		MaskIPv4:   ipv4,
 		MaskAPIKey: apiKey,
 	}
+}
+
+// NewMaskerFromRules creates a Masker with all supported PII rule flags.
+func NewMaskerFromRules(phone, email, ipv4, apiKey, idCard, bankCard bool) *Masker {
+	return &Masker{
+		MaskPhone:    phone,
+		MaskEmail:    email,
+		MaskIPv4:     ipv4,
+		MaskAPIKey:   apiKey,
+		MaskIDCard:   idCard,
+		MaskBankCard: bankCard,
+	}
+}
+
+// ContainsPII reports whether text matches any enabled PII rule without mutating a Vault.
+func (m *Masker) ContainsPII(text string) bool {
+	if text == "" {
+		return false
+	}
+	if m.MaskAPIKey && reAPIKey.MatchString(text) {
+		return true
+	}
+	if m.MaskEmail && reEmail.MatchString(text) {
+		return true
+	}
+	if m.MaskIDCard && reIDCard.MatchString(text) {
+		return true
+	}
+	if m.MaskBankCard {
+		for _, match := range reBankCard.FindAllString(text, -1) {
+			if passesLuhn(match) {
+				return true
+			}
+		}
+	}
+	if m.MaskIPv4 && reIPv4.MatchString(text) {
+		return true
+	}
+	if m.MaskPhone && rePhone.MatchString(text) {
+		return true
+	}
+	return false
 }
 
 // MaskText applies enabled PII masking rules to the given text and records to Vault.
@@ -185,14 +250,31 @@ func (m *Masker) MaskText(text string, vault *Vault) string {
 		})
 	}
 
-	// 3. Intranet IPv4 addresses
+	// 3. Chinese 18-digit ID cards (before phone/bankcard to avoid partial digit overlap)
+	if m.MaskIDCard {
+		result = reIDCard.ReplaceAllStringFunc(result, func(match string) string {
+			return vault.Mask(TypeIDCard, match)
+		})
+	}
+
+	// 4. Bank cards (Luhn-validated 16-19 digits)
+	if m.MaskBankCard {
+		result = reBankCard.ReplaceAllStringFunc(result, func(match string) string {
+			if passesLuhn(match) {
+				return vault.Mask(TypeBankCard, match)
+			}
+			return match
+		})
+	}
+
+	// 5. Intranet IPv4 addresses
 	if m.MaskIPv4 {
 		result = reIPv4.ReplaceAllStringFunc(result, func(match string) string {
 			return vault.Mask(TypeIPv4, match)
 		})
 	}
 
-	// 4. Phone numbers
+	// 6. Phone numbers
 	if m.MaskPhone {
 		result = rePhone.ReplaceAllStringFunc(result, func(match string) string {
 			return vault.Mask(TypePhone, match)
@@ -202,11 +284,35 @@ func (m *Masker) MaskText(text string, vault *Vault) string {
 	return result
 }
 
+func passesLuhn(digits string) bool {
+	if len(digits) < 12 {
+		return false
+	}
+	sum := 0
+	alt := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		d := int(digits[i] - '0')
+		if d < 0 || d > 9 {
+			return false
+		}
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
 // SlidingRehydrator maintains a lightweight buffer across streaming chunks to prevent
 // placeholders (e.g., {{EC_PII_PHONE_1}}) from being cut in half across chunk boundaries.
 type SlidingRehydrator struct {
-	vault   *Vault
-	pending string
+	vault      *Vault
+	pending    string
+	skipAPIKey bool
 }
 
 // NewSlidingRehydrator creates a sliding-window rehydrator attached to the request vault.
@@ -215,6 +321,26 @@ func NewSlidingRehydrator(vault *Vault) *SlidingRehydrator {
 		vault:   vault,
 		pending: "",
 	}
+}
+
+// NewSlidingRehydratorExcludingAPIKey creates a sliding-window rehydrator that keeps
+// APIKEY placeholders redacted (used for tool_calls arguments).
+func NewSlidingRehydratorExcludingAPIKey(vault *Vault) *SlidingRehydrator {
+	return &SlidingRehydrator{
+		vault:      vault,
+		pending:    "",
+		skipAPIKey: true,
+	}
+}
+
+func (r *SlidingRehydrator) applyRehydrate(s string) string {
+	if r.vault == nil {
+		return s
+	}
+	if r.skipAPIKey {
+		return r.vault.RehydrateExcludingAPIKey(s)
+	}
+	return r.vault.Rehydrate(s)
 }
 
 // Feed receives a chunk of streaming text, resolves any completed placeholders,
@@ -233,17 +359,11 @@ func (r *SlidingRehydrator) Feed(chunk string) string {
 	if cut < len(combined) {
 		safePart := combined[:cut]
 		r.pending = combined[cut:]
-		if r.vault != nil {
-			return r.vault.Rehydrate(safePart)
-		}
-		return safePart
+		return r.applyRehydrate(safePart)
 	}
 
 	// All content is safe to flush
-	if r.vault != nil {
-		return r.vault.Rehydrate(combined)
-	}
-	return combined
+	return r.applyRehydrate(combined)
 }
 
 // Flush returns any remaining bytes in the pending buffer (rehydrated if possible).
@@ -253,10 +373,7 @@ func (r *SlidingRehydrator) Flush() string {
 	}
 	rem := r.pending
 	r.pending = ""
-	if r.vault != nil {
-		return r.vault.Rehydrate(rem)
-	}
-	return rem
+	return r.applyRehydrate(rem)
 }
 
 // findUnclosedPrefixCut determines where to cut the text so that any unclosed
