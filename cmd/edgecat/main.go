@@ -112,19 +112,27 @@ func main() {
 	}
 
 	// 7. Start HTTP Server
+	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("[Server] EdgeCat listening on http://%s", addr)
 		log.Printf("[Server] Ingress endpoints: /v1/chat/completions, /health, /admin/status, /v1/models")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Server] HTTP server encountered fatal error: %v", err)
+			errCh <- err
 		}
 	}()
 
-	// 8. Graceful shutdown on SIGINT / SIGTERM
+	// 8. Graceful shutdown on SIGINT / SIGTERM or fatal server error
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("[Server] Received shutdown signal: %v. Initiating graceful drain...", sig)
+	select {
+	case err := <-errCh:
+		log.Printf("[Server] HTTP server encountered fatal error: %v", err)
+		quotaMgr.Close()
+		_ = auditLogger.Close()
+		os.Exit(1)
+	case sig := <-quit:
+		log.Printf("[Server] Received shutdown signal: %v. Initiating graceful drain...", sig)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

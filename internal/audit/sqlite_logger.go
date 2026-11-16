@@ -231,7 +231,7 @@ func (l *Logger) writeBatch(batch []*Record) error {
 			r.TTFTMs,
 			r.PIIRedactedCount,
 			r.Status,
-			r.CreatedAt.Format("2006-01-02 15:04:05"),
+			r.CreatedAt.UTC().Format(time.RFC3339),
 		)
 		if err != nil {
 			return fmt.Errorf("execute batch insert: %w", err)

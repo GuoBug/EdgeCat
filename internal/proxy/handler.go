@@ -387,6 +387,116 @@ func clientWantsStrictJSON(r *http.Request, req *Request) bool {
 	return req.ResponseFormatType() == "json_object"
 }
 
+type dispatchResult struct {
+	target     string
+	model      string
+	ttftMs     int64
+	usingLocal bool
+	resp       *http.Response
+	firstChunk []byte
+	cancel     context.CancelFunc
+	rawBody    []byte
+	handled    bool
+}
+
+// dispatch executes the local-first admission, TTFT fallback, cloud quota check,
+// and upstream invocation shared by streaming and non-streaming paths.
+func (h *Handler) dispatch(
+	w http.ResponseWriter,
+	r *http.Request,
+	reqID string,
+	req *Request,
+	decision *router.Decision,
+	startTime time.Time,
+	piiRedacted int,
+	clientName string,
+	forceLocalStream bool,
+) dispatchResult {
+	res := dispatchResult{
+		target: decision.Target,
+		model:  decision.TargetModel,
+	}
+
+	if decision.AcquiredLocal {
+		var prevStreamOpts any
+		var hadStreamOpts bool
+		if forceLocalStream {
+			req.fields["stream"] = true
+			prevStreamOpts, hadStreamOpts = req.fields["stream_options"]
+			if !hadStreamOpts {
+				req.fields["stream_options"] = map[string]any{"include_usage": true}
+			}
+		}
+
+		resp, chunk, capturedTTFT, cancelLocal, err := h.tryLocalStream(r.Context(), req, decision.TargetModel)
+
+		if forceLocalStream {
+			req.fields["stream"] = false
+			if hadStreamOpts {
+				req.fields["stream_options"] = prevStreamOpts
+			} else {
+				delete(req.fields, "stream_options")
+			}
+		}
+
+		if err == nil {
+			res.usingLocal = true
+			res.resp = resp
+			res.firstChunk = chunk
+			res.ttftMs = capturedTTFT
+			res.cancel = cancelLocal
+			return res
+		}
+
+		outcome := classifyLocalError(r.Context(), err)
+		h.router.RecordLocalOutcome(outcome)
+		h.router.ReleaseLocal()
+		decision.AcquiredLocal = false
+
+		if outcome == router.OutcomeNeutral {
+			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, StatusClientClosedRequest)
+			res.handled = true
+			return res
+		}
+
+		log.Printf("[Proxy %s] Local fallback (%v). Rerouting to Cloud tier.", reqID, err)
+		h.router.RecordFallback()
+		res.target = router.TargetCloud
+		res.model = h.router.ResolveModel(router.TargetCloud, req.Model())
+	}
+
+	if !h.checkCloudQuota(w, clientName) {
+		res.handled = true
+		return res
+	}
+
+	if req.Stream() {
+		cloudResp, err := h.callCloudStream(r.Context(), req, res.model)
+		if err != nil {
+			h.quotaMgr.RefundCloud(clientName)
+			log.Printf("[Proxy %s] Cloud streaming error: %v", reqID, err)
+			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
+			h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, http.StatusBadGateway)
+			res.handled = true
+			return res
+		}
+		res.resp = cloudResp
+		return res
+	}
+
+	rawBody, err := h.callCloudNonStreaming(r.Context(), req, res.model)
+	if err != nil {
+		h.quotaMgr.RefundCloud(clientName)
+		log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
+		writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
+		h.recordAudit(reqID, clientName, res.target, res.model, startTime, 0, piiRedacted, http.StatusBadGateway)
+		res.handled = true
+		return res
+	}
+	res.rawBody = rawBody
+	return res
+}
+
 func (h *Handler) handleStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -410,62 +520,21 @@ func (h *Handler) handleStreaming(
 	// rolling idle deadline that is refreshed on every successful flush.
 	touchDeadline := newStreamDeadlineRefresher(w, h.cfg.Server.StreamIdleTimeoutMs)
 
-	var upstreamResp *http.Response
-	var finalTarget = decision.Target
-	var finalModel = decision.TargetModel
-	var ttftMs int64 = 0
-	var firstChunk []byte
-	var usingLocal bool
-
-	// If Local was acquired, attempt local streaming with strict TTFT timeout watcher
-	if decision.AcquiredLocal {
-		resp, chunk, capturedTTFT, cancelLocal, err := h.tryLocalStream(r.Context(), req, decision.TargetModel)
-		if err == nil {
-			// The local stream must stay alive until the body is fully relayed,
-			// so cancellation is deferred to the end of this handler.
-			defer cancelLocal()
-			upstreamResp = resp
-			firstChunk = chunk
-			ttftMs = capturedTTFT
-			usingLocal = true
-		} else {
-			outcome := classifyLocalError(r.Context(), err)
-			h.router.RecordLocalOutcome(outcome)
-			h.router.ReleaseLocal()
-			decision.AcquiredLocal = false
-
-			if outcome == router.OutcomeNeutral {
-				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, StatusClientClosedRequest)
-				return
-			}
-
-			// Local failed or TTFT timed out! Trigger fallback to Cloud tier
-			log.Printf("[Proxy %s] Local streaming fallback (%v). Rerouting to Cloud tier.", reqID, err)
-			h.router.RecordFallback()
-
-			finalTarget = router.TargetCloud
-			finalModel = h.router.ResolveModel(router.TargetCloud, req.Model())
-		}
+	res := h.dispatch(w, r, reqID, req, &decision, startTime, piiRedacted, clientName, false)
+	if res.handled {
+		return
 	}
-
-	// If not routed to local or local timed out, route to Cloud
-	if upstreamResp == nil {
-		// D1 & R2.3: Check cloud quota in the pre-WriteHeader window
-		if !h.checkCloudQuota(w, clientName) {
-			return
-		}
-
-		cloudResp, err := h.callCloudStream(r.Context(), req, finalModel)
-		if err != nil {
-			h.quotaMgr.RefundCloud(clientName)
-			log.Printf("[Proxy %s] Cloud fallback error: %v", reqID, err)
-			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
-			h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, http.StatusBadGateway)
-			return
-		}
-		upstreamResp = cloudResp
+	if res.cancel != nil {
+		defer res.cancel()
 	}
-	defer upstreamResp.Body.Close()
+	defer res.resp.Body.Close()
+
+	finalTarget := res.target
+	finalModel := res.model
+	ttftMs := res.ttftMs
+	firstChunk := res.firstChunk
+	usingLocal := res.usingLocal
+	upstreamResp := res.resp
 
 	// Write SSE Response Headers
 	touchDeadline()
@@ -620,6 +689,24 @@ func newStreamDeadlineRefresher(w http.ResponseWriter, idleTimeoutMs int) func()
 	return touch
 }
 
+func newUpstreamRequest(ctx context.Context, endpoint, apiKey string, req *Request, targetModel string) (*http.Request, error) {
+	req.SetModel(targetModel)
+	payload, err := req.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	url := strings.TrimRight(endpoint, "/") + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	return httpReq, nil
+}
+
 // tryLocalStream attempts to initiate a stream with the local tier within ttft_timeout_ms.
 // The TTFT timer starts immediately and covers connection, headers, and the first body byte.
 //
@@ -631,27 +718,15 @@ func (h *Handler) tryLocalStream(
 	req *Request,
 	targetModel string,
 ) (*http.Response, []byte, int64, context.CancelFunc, error) {
-	req.SetModel(targetModel)
-	payload, err := req.Marshal()
-	if err != nil {
-		return nil, nil, 0, nil, err
-	}
-
 	ttftTimeout := h.router.LocalTTFTTimeout()
 	ttftTimer := time.NewTimer(ttftTimeout)
 	defer ttftTimer.Stop()
 
 	localCtx, localCancel := context.WithCancel(ctx)
-
-	url := strings.TrimRight(h.router.LocalEndpoint(), "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(localCtx, http.MethodPost, url, bytes.NewReader(payload))
+	httpReq, err := newUpstreamRequest(localCtx, h.router.LocalEndpoint(), h.router.LocalAPIKey(), req, targetModel)
 	if err != nil {
 		localCancel()
 		return nil, nil, 0, nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.router.LocalAPIKey(); apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	start := time.Now()
@@ -732,27 +807,16 @@ func (h *Handler) callCloudStream(
 	req *Request,
 	targetModel string,
 ) (*http.Response, error) {
-	req.SetModel(targetModel)
-	payload, err := req.Marshal()
-	if err != nil {
-		return nil, err
-	}
-
 	cloudCtx, cancel := context.WithCancel(ctx)
 	headerTimer := time.AfterFunc(h.router.CloudTimeout(), func() {
 		cancel()
 	})
 	defer headerTimer.Stop()
 
-	url := strings.TrimRight(h.router.CloudEndpoint(), "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(cloudCtx, http.MethodPost, url, bytes.NewReader(payload))
+	httpReq, err := newUpstreamRequest(cloudCtx, h.router.CloudEndpoint(), h.router.CloudAPIKey(), req, targetModel)
 	if err != nil {
 		cancel()
 		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.router.CloudAPIKey(); apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	resp, err := h.httpClient.Do(httpReq)
@@ -783,134 +847,89 @@ func (h *Handler) handleNonStreaming(
 	strictJSON bool,
 	clientName string,
 ) {
-	var finalTarget = decision.Target
-	var finalModel = decision.TargetModel
-	var rawResp []byte
-	var err error
-	var ttftMs int64 = 0
-
-	// If Local was acquired, stream with TTFT admission check and aggregate.
 	// Even though the client requested a non-streaming response, calling local with
 	// stream:true lets us reuse the strict TTFT cutoff, while allowing healthy long
 	// generations to proceed without timing out arbitrarily.
-	if decision.AcquiredLocal {
-		req.fields["stream"] = true
-		prevStreamOpts, hadStreamOpts := req.fields["stream_options"]
-		if !hadStreamOpts {
-			req.fields["stream_options"] = map[string]any{"include_usage": true}
-		}
-		localResp, firstChunk, localTTFT, cancelLocal, localErr := h.tryLocalStream(r.Context(), req, decision.TargetModel)
-		req.fields["stream"] = false // restore client non-streaming setting
-		if hadStreamOpts {
-			req.fields["stream_options"] = prevStreamOpts
-		} else {
-			delete(req.fields, "stream_options")
-		}
+	res := h.dispatch(w, r, reqID, req, &decision, startTime, piiRedacted, clientName, true)
+	if res.handled {
+		return
+	}
 
-		if localErr != nil {
-			outcome := classifyLocalError(r.Context(), localErr)
-			h.router.RecordLocalOutcome(outcome)
+	finalTarget := res.target
+	finalModel := res.model
+	ttftMs := res.ttftMs
+	rawResp := res.rawBody
+
+	if res.usingLocal {
+		localResp := res.resp
+		firstChunk := res.firstChunk
+		cancelLocal := res.cancel
+
+		isSSE := strings.Contains(strings.ToLower(localResp.Header.Get("Content-Type")), "text/event-stream") ||
+			bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte("data:")) ||
+			bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte(":"))
+
+		if isSSE {
+			reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), localResp.Body))
+			aggData, aggErr := ReadAndAggregateStream(reader, h.router.LocalStreamIdleTimeout(), cancelLocal, finalModel)
+			localResp.Body.Close()
+			cancelLocal()
 			h.router.ReleaseLocal()
 			decision.AcquiredLocal = false
 
-			if outcome == router.OutcomeNeutral {
-				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, StatusClientClosedRequest)
+			if aggErr != nil {
+				if r.Context().Err() != nil {
+					h.router.RecordLocalOutcome(router.OutcomeNeutral)
+					h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, StatusClientClosedRequest)
+					return
+				}
+				h.router.RecordLocalOutcome(router.OutcomeFailure)
+				log.Printf("[Proxy %s] Local stream aggregation failed: %v", reqID, aggErr)
+
+				statusCode := http.StatusBadGateway
+				errCode := "local_stream_error"
+				errMsg := fmt.Sprintf("local stream aggregation failed: %v", aggErr)
+				var streamErr *UpstreamStreamError
+				switch {
+				case errors.Is(aggErr, ErrUpstreamIdleTimeout):
+					statusCode = http.StatusGatewayTimeout
+					errCode = "upstream_idle_timeout"
+					errMsg = "local stream idle timeout"
+				case errors.Is(aggErr, ErrUpstreamTruncated):
+					statusCode = http.StatusBadGateway
+					errCode = "upstream_truncated"
+					errMsg = "local stream ended unexpectedly before completion"
+				case errors.As(aggErr, &streamErr):
+					statusCode = http.StatusBadGateway
+					errCode = "upstream_stream_error"
+					errMsg = streamErr.Message
+				}
+
+				writeOpenAIError(w, statusCode, "gateway_error", errCode, errMsg)
+				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, statusCode)
 				return
 			}
 
-			log.Printf("[Proxy %s] Local non-streaming TTFT fallback: %v. Rerouting to Cloud.", reqID, localErr)
-			h.router.RecordFallback()
-
-			finalTarget = router.TargetCloud
-			finalModel = h.router.ResolveModel(router.TargetCloud, req.Model())
+			h.router.RecordLocalOutcome(router.OutcomeSuccess)
+			rawResp = aggData
 		} else {
-			// First token arrived in time! Local inference is underway.
-			// Read remainder with idle timeout. No cloud fallback from this point forward.
-			ttftMs = localTTFT
+			// Local tier returned non-streaming JSON directly
+			remainder, readErr := io.ReadAll(localResp.Body)
+			localResp.Body.Close()
+			cancelLocal()
+			h.router.ReleaseLocal()
+			decision.AcquiredLocal = false
 
-			isSSE := strings.Contains(strings.ToLower(localResp.Header.Get("Content-Type")), "text/event-stream") ||
-				bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte("data:")) ||
-				bytes.HasPrefix(bytes.TrimSpace(firstChunk), []byte(":"))
-
-			if isSSE {
-				reader := bufio.NewReader(io.MultiReader(bytes.NewReader(firstChunk), localResp.Body))
-				aggData, aggErr := ReadAndAggregateStream(reader, h.router.LocalStreamIdleTimeout(), cancelLocal, decision.TargetModel)
-				localResp.Body.Close()
-				cancelLocal()
-				h.router.ReleaseLocal()
-				decision.AcquiredLocal = false
-
-				if aggErr != nil {
-					if r.Context().Err() != nil {
-						h.router.RecordLocalOutcome(router.OutcomeNeutral)
-						h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, StatusClientClosedRequest)
-						return
-					}
-					h.router.RecordLocalOutcome(router.OutcomeFailure)
-					log.Printf("[Proxy %s] Local stream aggregation failed: %v", reqID, aggErr)
-
-					statusCode := http.StatusBadGateway
-					errCode := "local_stream_error"
-					errMsg := fmt.Sprintf("local stream aggregation failed: %v", aggErr)
-					var streamErr *UpstreamStreamError
-					switch {
-					case errors.Is(aggErr, ErrUpstreamIdleTimeout):
-						statusCode = http.StatusGatewayTimeout
-						errCode = "upstream_idle_timeout"
-						errMsg = "local stream idle timeout"
-					case errors.Is(aggErr, ErrUpstreamTruncated):
-						statusCode = http.StatusBadGateway
-						errCode = "upstream_truncated"
-						errMsg = "local stream ended unexpectedly before completion"
-					case errors.As(aggErr, &streamErr):
-						statusCode = http.StatusBadGateway
-						errCode = "upstream_stream_error"
-						errMsg = streamErr.Message
-					}
-
-					writeOpenAIError(w, statusCode, "gateway_error", errCode, errMsg)
-					h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, statusCode)
-					return
-				}
-
-				h.router.RecordLocalOutcome(router.OutcomeSuccess)
-				rawResp = aggData
-			} else {
-				// Local tier returned non-streaming JSON directly
-				remainder, readErr := io.ReadAll(localResp.Body)
-				localResp.Body.Close()
-				cancelLocal()
-				h.router.ReleaseLocal()
-				decision.AcquiredLocal = false
-
-				if readErr != nil {
-					h.router.RecordLocalOutcome(router.OutcomeFailure)
-					log.Printf("[Proxy %s] Local read failed: %v", reqID, readErr)
-					writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("local inference failed: %v", readErr))
-					h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, http.StatusBadGateway)
-					return
-				}
-
-				h.router.RecordLocalOutcome(router.OutcomeSuccess)
-				rawResp = append(firstChunk, remainder...)
+			if readErr != nil {
+				h.router.RecordLocalOutcome(router.OutcomeFailure)
+				log.Printf("[Proxy %s] Local read failed: %v", reqID, readErr)
+				writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("local inference failed: %v", readErr))
+				h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, ttftMs, piiRedacted, http.StatusBadGateway)
+				return
 			}
-		}
-	}
 
-	// Route to Cloud if local not used or fallback triggered
-	if len(rawResp) == 0 {
-		// D1 & R2.3: Check cloud quota in pre-WriteHeader window
-		if !h.checkCloudQuota(w, clientName) {
-			return
-		}
-
-		rawResp, err = h.callCloudNonStreaming(r.Context(), req, finalModel)
-		if err != nil {
-			h.quotaMgr.RefundCloud(clientName)
-			log.Printf("[Proxy %s] Cloud non-streaming error: %v", reqID, err)
-			writeOpenAIError(w, http.StatusBadGateway, "gateway_error", "upstream_error", fmt.Sprintf("inference tier failed: %v", err))
-			h.recordAudit(reqID, clientName, finalTarget, finalModel, startTime, 0, piiRedacted, http.StatusBadGateway)
-			return
+			h.router.RecordLocalOutcome(router.OutcomeSuccess)
+			rawResp = append(firstChunk, remainder...)
 		}
 	}
 
@@ -976,24 +995,12 @@ func (h *Handler) callLocalNonStreaming(
 	req *Request,
 	targetModel string,
 ) ([]byte, error) {
-	req.SetModel(targetModel)
-	payload, err := req.Marshal()
-	if err != nil {
-		return nil, err
-	}
-
-	timeout := h.router.LocalStreamIdleTimeout()
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	callCtx, cancel := context.WithTimeout(ctx, h.router.LocalStreamIdleTimeout())
 	defer cancel()
 
-	url := strings.TrimRight(h.router.LocalEndpoint(), "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(payload))
+	httpReq, err := newUpstreamRequest(callCtx, h.router.LocalEndpoint(), h.router.LocalAPIKey(), req, targetModel)
 	if err != nil {
 		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.router.LocalAPIKey(); apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	resp, err := h.httpClient.Do(httpReq)
@@ -1003,7 +1010,7 @@ func (h *Handler) callLocalNonStreaming(
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("local returned status %d", resp.StatusCode)
+		return nil, &upstreamStatusError{tier: "local", code: resp.StatusCode}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -1021,23 +1028,12 @@ func (h *Handler) callCloudNonStreaming(
 	req *Request,
 	targetModel string,
 ) ([]byte, error) {
-	req.SetModel(targetModel)
-	payload, err := req.Marshal()
-	if err != nil {
-		return nil, err
-	}
-
 	callCtx, cancel := context.WithTimeout(ctx, h.router.CloudTimeout())
 	defer cancel()
 
-	url := strings.TrimRight(h.router.CloudEndpoint(), "/") + "/chat/completions"
-	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(payload))
+	httpReq, err := newUpstreamRequest(callCtx, h.router.CloudEndpoint(), h.router.CloudAPIKey(), req, targetModel)
 	if err != nil {
 		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if apiKey := h.router.CloudAPIKey(); apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 	}
 
 	resp, err := h.httpClient.Do(httpReq)
