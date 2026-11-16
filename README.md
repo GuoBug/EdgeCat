@@ -229,10 +229,10 @@ Guided by the principle that **"the gateway is the core, while a 'Personal AI Hu
 
 ## Known Limitations
 
-- **Regex-based PII detection**: Only covers Chinese mobile numbers, emails, private IPv4 addresses, and common API key prefixes; national IDs, bank cards, and unstructured secrets are not matched. Rehydration also assumes the upstream LLM echoes `{{EC_PII_...}}` placeholders verbatim.
-- **Placeholder exfiltration via indirect prompt injection**: If a cloud model is tricked into embedding a placeholder inside `tool_calls.arguments`, EdgeCat rehydrates it before returning to the client.
+- **Regex-based PII detection**: Built-in rules cover Chinese mobile numbers, emails, private IPv4 addresses, common API key prefixes, and opt-in Chinese 18-digit IDs / Luhn-validated bank cards (`mask_idcard`, `mask_bankcard`); unstructured secrets are not matched. Rehydration also assumes the upstream LLM echoes `{{EC_PII_...}}` placeholders verbatim.
+- **Placeholder exfiltration via indirect prompt injection**: `block_apikey_tool_rehydrate` (enabled by default) keeps `APIKEY` placeholders redacted inside `tool_calls.arguments`; other PII types in tool arguments are still rehydrated.
 - **Fallback re-computation**: If local inference times out on TTFT or returns 5xx, EdgeCat re-dispatches the request to the cloud tier; once the first local token arrives, mid-stream stalls fail with `504` instead of falling back.
-- **Strict JSON scope**: `strict_json_enabled` validates `json_object` / `X-EdgeCat-Strict-JSON: true` on non-streaming responses only; `json_schema` validation and SSE stream repair are not implemented.
+- **Strict JSON scope**: `strict_json_enabled` validates `json_object` / `json_schema` (syntax-level) and `X-EdgeCat-Strict-JSON: true` on non-streaming responses only; full JSON Schema structural enforcement and SSE stream repair are not implemented.
 
 ---
 

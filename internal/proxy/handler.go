@@ -360,9 +360,9 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	strictJSON := h.guard.StrictJSONEnabled && clientWantsStrictJSON(r, req)
 
 	if req.Stream() {
-		h.handleStreaming(w, r, requestID, req, decision, vault, startTime, clientName, piiPolicy, localOnly)
+		h.handleStreaming(w, r, requestID, req, &decision, vault, startTime, clientName, piiPolicy, localOnly)
 	} else {
-		h.handleNonStreaming(w, r, requestID, req, decision, vault, startTime, strictJSON, clientName, piiPolicy, localOnly)
+		h.handleNonStreaming(w, r, requestID, req, &decision, vault, startTime, strictJSON, clientName, piiPolicy, localOnly)
 	}
 }
 
@@ -553,7 +553,7 @@ func (h *Handler) handleStreaming(
 	r *http.Request,
 	reqID string,
 	req *Request,
-	decision router.Decision,
+	decision *router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
 	clientName string,
@@ -572,7 +572,7 @@ func (h *Handler) handleStreaming(
 	// rolling idle deadline that is refreshed on every successful flush.
 	touchDeadline := newStreamDeadlineRefresher(w, h.cfg.Server.StreamIdleTimeoutMs)
 
-	res := h.dispatch(w, r, reqID, req, &decision, vault, startTime, clientName, piiPolicy, localOnly, false)
+	res := h.dispatch(w, r, reqID, req, decision, vault, startTime, clientName, piiPolicy, localOnly, false)
 	if res.handled {
 		return
 	}
@@ -893,7 +893,7 @@ func (h *Handler) handleNonStreaming(
 	r *http.Request,
 	reqID string,
 	req *Request,
-	decision router.Decision,
+	decision *router.Decision,
 	vault *filter.Vault,
 	startTime time.Time,
 	strictJSON bool,
@@ -904,7 +904,7 @@ func (h *Handler) handleNonStreaming(
 	// Even though the client requested a non-streaming response, calling local with
 	// stream:true lets us reuse the strict TTFT cutoff, while allowing healthy long
 	// generations to proceed without timing out arbitrarily.
-	res := h.dispatch(w, r, reqID, req, &decision, vault, startTime, clientName, piiPolicy, localOnly, true)
+	res := h.dispatch(w, r, reqID, req, decision, vault, startTime, clientName, piiPolicy, localOnly, true)
 	if res.handled {
 		return
 	}

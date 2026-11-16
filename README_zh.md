@@ -227,10 +227,10 @@ EdgeCat 秉持 **“网关是本体，中枢是用法”** 的极简工程哲学
 
 ## 已知限制与边界 (Known Limitations)
 
-- **基于正则的 PII 识别存在漏报/误报边界**：当前内置正则仅覆盖中国大陆手机号、邮箱、内网 IPv4 及常见 API Key 前缀，尚未覆盖身份证号、银行卡号或非结构化秘密；出站还原也依赖上游模型原样保留 `{{EC_PII_...}}` 占位符。
-- **间接 Prompt 注入的占位符外泄风险**：若云端模型受注入诱导而在 `tool_calls.arguments` 中输出占位符，网关在返回给客户端前会按 Vault 还原为原文。
+- **基于正则的 PII 识别存在漏报/误报边界**：内置规则覆盖中国大陆手机号、邮箱、内网 IPv4、常见 API Key 前缀，以及可选开启的 18 位身份证与 Luhn 校验银行卡（`mask_idcard` / `mask_bankcard`），暂不覆盖非结构化秘密；出站还原也依赖上游模型原样保留 `{{EC_PII_...}}` 占位符。
+- **间接 Prompt 注入的占位符外泄风险**：`block_apikey_tool_rehydrate`（默认开启）会阻止在 `tool_calls.arguments` 中还原 `APIKEY` 占位符，但其它类型 PII 在工具参数中仍会还原。
 - **降级重算代价**：本地 TTFT 超时或返回 5xx 时，网关会切到云端重新发起同一请求；一旦本地已吐出首字，后续流中断将直接返回 `504` 而不会再切云端。
-- **Strict JSON 适用范围**：`strict_json_enabled` 仅对非流式响应生效（支持 `json_object` 与 `X-EdgeCat-Strict-JSON: true`），暂不支持 `json_schema` 校验与流式修复。
+- **Strict JSON 适用范围**：`strict_json_enabled` 仅对非流式响应生效（识别 `json_object`、`json_schema` 的 JSON 语法与 `X-EdgeCat-Strict-JSON: true`），暂不支持完整 JSON Schema 结构校验与流式修复。
 
 ---
 
