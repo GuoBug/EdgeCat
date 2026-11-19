@@ -56,9 +56,32 @@ func (r *Request) Model() string {
 	return r.logicalModel
 }
 
-// SetModel rewrites the model field in place (used by tier model aliasing).
+// SetModel rewrites the outbound wire model field in place (used by tier model aliasing).
 func (r *Request) SetModel(model string) {
 	r.fields["model"] = model
+}
+
+// SetLogicalModel updates both the logical model used for tier/fallback routing
+// and the outbound wire model field. Intended for pre-routing RequestMutators.
+func (r *Request) SetLogicalModel(model string) {
+	r.logicalModel = model
+	r.fields["model"] = model
+}
+
+// Get retrieves a top-level JSON field from the lossless request map.
+func (r *Request) Get(key string) (any, bool) {
+	v, ok := r.fields[key]
+	return v, ok
+}
+
+// Set writes a top-level JSON field into the lossless request map.
+func (r *Request) Set(key string, value any) {
+	r.fields[key] = value
+}
+
+// Delete removes a top-level JSON field from the lossless request map.
+func (r *Request) Delete(key string) {
+	delete(r.fields, key)
 }
 
 // Stream reports whether the client asked for an SSE response.
@@ -81,6 +104,35 @@ func (r *Request) ResponseFormatType() string {
 func (r *Request) Messages() []any {
 	msgs, _ := r.fields["messages"].([]any)
 	return msgs
+}
+
+// SetMessages replaces the messages array in place.
+func (r *Request) SetMessages(msgs []any) {
+	r.fields["messages"] = msgs
+}
+
+// PrependSystemMessage inserts a system role message at the beginning of messages.
+func (r *Request) PrependSystemMessage(content string) {
+	existing := r.Messages()
+	updated := make([]any, 0, len(existing)+1)
+	updated = append(updated, map[string]any{
+		"role":    "system",
+		"content": content,
+	})
+	updated = append(updated, existing...)
+	r.fields["messages"] = updated
+}
+
+// AppendMessage appends a role/content message to the end of messages.
+func (r *Request) AppendMessage(role, content string) {
+	existing := r.Messages()
+	updated := make([]any, 0, len(existing)+1)
+	updated = append(updated, existing...)
+	updated = append(updated, map[string]any{
+		"role":    role,
+		"content": content,
+	})
+	r.fields["messages"] = updated
 }
 
 // Marshal re-encodes the request. HTML escaping is disabled so that payloads are

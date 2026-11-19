@@ -65,9 +65,9 @@ This document tracks **EdgeCat**'s product positioning, completed architectural 
 
 ### 🔭 Phase 3: Extensibility Hooks & Production Telemetry (Future Backlog)
 
-| ID | Feature | Detailed Engineering Specification | Priority |
+| ID | Feature | Detailed Engineering Specification | Status / Priority |
 | :--- | :--- | :--- | :---: |
-| **R3.1** | **`RequestMutator` Extension Hook** | Define a clean pre-routing request mutator interface in `internal/proxy` for opt-in plugins. | **P2** |
+| **R3.1** | **Two-Stage `RequestMutator` Extension Hook** | Implemented in `internal/proxy/mutator.go` with `StagePreMask` (before PII masking) and `StagePostMask` (after PII masking, before routing), `WithRequestMutators` / `UseMutator` registration, custom `*MutatorError` rejection responses, and `/admin/status` observability. | ✅ Completed |
 | **R3.2** | **Opt-In Layered Memory Plugin Example** | Built strictly as an optional `RequestMutator` example (disabled by default):<br>1. Separate SQLite Writer (`MaxOpenConns(1)`) and Reader pools.<br>2. Use `tokenize='trigram'` for CJK full-text search.<br>3. Store only distilled non-PII facts (`Facts`), isolate namespaces by `client_name`, and use `HMAC-SHA256` stable keys if cross-request PII references are required. | **P3** |
 | **R3.3** | **90-Day Homelab Telemetry Case Study** | Run EdgeCat + PatchCat continuously on a personal workstation/NAS and publish empirical metrics on local 7B offload ratio, TTFT fallback frequency, and cloud cost savings. | **P2** |
 

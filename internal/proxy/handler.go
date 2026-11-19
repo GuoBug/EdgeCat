@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +45,9 @@ type Handler struct {
 	audit      *audit.Logger
 	quotaMgr   *quota.Manager
 	httpClient *http.Client
+
+	mutatorMu sync.RWMutex
+	mutators  []RequestMutator
 }
 
 // NewHandler creates a new EdgeCat proxy handler.
@@ -54,11 +58,12 @@ func NewHandler(
 	g *contract.Guard,
 	a *audit.Logger,
 	qm *quota.Manager,
+	opts ...HandlerOption,
 ) *Handler {
 	client := &http.Client{
 		Timeout: 0, // Individual request contexts manage timeouts
 	}
-	return &Handler{
+	h := &Handler{
 		cfg:        cfg,
 		masker:     masker,
 		router:     r,
@@ -67,6 +72,45 @@ func NewHandler(
 		quotaMgr:   qm,
 		httpClient: client,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(h)
+		}
+	}
+	return h
+}
+
+// UseMutator registers one or more two-stage RequestMutator hooks.
+// Nil mutators are ignored. Safe for concurrent registration and inspection.
+func (h *Handler) UseMutator(mutators ...RequestMutator) {
+	h.mutatorMu.Lock()
+	defer h.mutatorMu.Unlock()
+	for _, m := range mutators {
+		if m != nil {
+			h.mutators = append(h.mutators, m)
+		}
+	}
+}
+
+// MutatorNames returns the names of all registered RequestMutators in execution order.
+func (h *Handler) MutatorNames() []string {
+	snap := h.mutatorSnapshot()
+	names := make([]string, len(snap))
+	for i, m := range snap {
+		names[i] = m.Name()
+	}
+	return names
+}
+
+func (h *Handler) mutatorSnapshot() []RequestMutator {
+	h.mutatorMu.RLock()
+	defer h.mutatorMu.RUnlock()
+	if len(h.mutators) == 0 {
+		return nil
+	}
+	out := make([]RequestMutator, len(h.mutators))
+	copy(out, h.mutators)
+	return out
 }
 
 // ServeHTTP handles /v1/chat/completions, /health, and /v1/models.
@@ -206,6 +250,7 @@ func (h *Handler) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			"written_total": h.audit.WrittenCount(),
 			"dropped_total": h.audit.DroppedCount(),
 		},
+		"mutators": h.MutatorNames(),
 	}
 
 	if h.quotaMgr != nil {
@@ -315,9 +360,34 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		piiPolicy = "mask_always"
 	}
 
+	// 0. Stage 1 RequestMutators (Pre-Mask: runs before PII policy evaluation and masking)
+	mutators := h.mutatorSnapshot()
+	var meta *RequestMeta
+	localOnly := false
+	if len(mutators) > 0 {
+		meta = &RequestMeta{
+			RequestID:   requestID,
+			ClientName:  clientName,
+			HTTPHeader:  r.Header.Clone(),
+			Stage:       StagePreMask,
+			PIIPolicy:   piiPolicy,
+			LocalOnly:   localOnly,
+			QueueWaitMs: queueWaitMs,
+			Values:      make(map[string]any),
+		}
+		for _, m := range mutators {
+			if err := m.MutatePreMask(r.Context(), req, meta); err != nil {
+				h.handleMutatorError(w, requestID, clientName, req.Model(), startTime, 0, StagePreMask, m.Name(), err)
+				return
+			}
+		}
+		piiPolicy = normalizePIIPolicy(meta.PIIPolicy)
+		localOnly = meta.LocalOnly
+		queueWaitMs = meta.QueueWaitMs
+	}
+
 	// 1. PII Policy Evaluation & Eager Masking (when policy == mask_always)
 	vault := filter.NewVault()
-	localOnly := false
 	if h.cfg.Filter.Enabled && h.masker != nil {
 		switch piiPolicy {
 		case "block":
@@ -335,6 +405,25 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 		default: // "mask_always"
 			MaskRequestContent(req, h.masker, vault)
 		}
+	}
+
+	// 1.5 Stage 2 RequestMutators (Post-Mask: runs after PII policy/masking, before routing)
+	if len(mutators) > 0 {
+		meta.Stage = StagePostMask
+		meta.PIIPolicy = piiPolicy
+		meta.LocalOnly = localOnly
+		meta.QueueWaitMs = queueWaitMs
+		meta.PIIRedactedCount = vault.RedactedCount()
+		for _, m := range mutators {
+			if err := m.MutatePostMask(r.Context(), req, meta); err != nil {
+				h.handleMutatorError(w, requestID, clientName, req.Model(), startTime, vault.RedactedCount(), StagePostMask, m.Name(), err)
+				return
+			}
+		}
+		// Security invariant: once PII policy enforces localOnly=true, a post-mask
+		// mutator may tighten routing to localOnly=true, never downgrade it to false.
+		localOnly = localOnly || meta.LocalOnly
+		queueWaitMs = meta.QueueWaitMs
 	}
 
 	// 2. Routing and concurrency admission (with optional queue_wait_ms)
@@ -364,6 +453,50 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	} else {
 		h.handleNonStreaming(w, r, requestID, req, &decision, vault, startTime, strictJSON, clientName, piiPolicy, localOnly)
 	}
+}
+
+func normalizePIIPolicy(policy string) string {
+	switch policy {
+	case "mask_always", "mask_on_egress", "local_only", "block":
+		return policy
+	default:
+		return "mask_always"
+	}
+}
+
+func (h *Handler) handleMutatorError(
+	w http.ResponseWriter,
+	reqID string,
+	clientName string,
+	model string,
+	startTime time.Time,
+	piiRedacted int,
+	stage MutationStage,
+	mutatorName string,
+	err error,
+) {
+	statusCode := http.StatusBadRequest
+	errType := "invalid_request_error"
+	errCode := "mutator_rejected"
+	errMsg := err.Error()
+
+	var mErr *MutatorError
+	if errors.As(err, &mErr) {
+		if mErr.StatusCode > 0 {
+			statusCode = mErr.StatusCode
+		}
+		if mErr.Type != "" {
+			errType = mErr.Type
+		}
+		if mErr.Code != "" {
+			errCode = mErr.Code
+		}
+		errMsg = mErr.Error()
+	}
+
+	log.Printf("[Proxy %s] Mutator %q rejected request at stage %s: %v", reqID, mutatorName, stage, err)
+	writeOpenAIError(w, statusCode, errType, errCode, errMsg)
+	h.recordAudit(reqID, clientName, "blocked", model, startTime, 0, piiRedacted, statusCode)
 }
 
 func (h *Handler) recordAudit(reqID, clientName, target, model string, startTime time.Time, ttftMs int64, piiRedacted, status int) {

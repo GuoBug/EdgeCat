@@ -53,9 +53,9 @@
 
 ### 🔭 Phase 3：可插拔扩展契约与长期验证（远期储备）
 
-| 编号 | 需求名称 | 详细工程规约 | 优先级 |
+| 编号 | 需求名称 | 详细工程规约 | 状态 / 优先级 |
 | :--- | :--- | :--- | :---: |
-| **R3.1** | **双阶段扩展接口 (`RequestMutator`)** | 在 `internal/proxy` 中提炼干净的入站请求变异器接口（在 PII 掩码前执行），方便后续以零侵入插件形式挂载自定义策略。 | **P2** |
+| **R3.1** | **双阶段扩展接口 (`RequestMutator`)** | 在 `internal/proxy/mutator.go` 中提炼双阶段入站请求变异器接口（`StagePreMask` 脱敏前注入与策略校验 + `StagePostMask` 脱敏后/路由前观测与路由收紧），支持 `WithRequestMutators` / `UseMutator` 零侵入挂载、`*MutatorError` 自定义拦截响应及 `/admin/status` 可观测暴露。 | ✅ 已完成 |
 | **R3.2** | **可选的分层记忆插件示例 (Opt-in Memory Plugin)** | 仅作为 `RequestMutator` 的插件示例（默认关闭）：<br>1. **读写双句柄**：分离 SQLite Writer（`MaxOpenConns(1)`）与 Reader 连接池，防止热路径读取被批量审计写入阻塞。<br>2. **中文 FTS5 支持**：显式使用 `tokenize='trigram'`。<br>3. **分层存储与稳定键**：长期记忆仅存本地模型蒸馏后的非敏感事实（Facts）；若需跨请求关联 PII，将自增序号升级为 `HMAC-SHA256(原文, 本地密钥)` 前 8 字节稳定键，并在开启的多用户场景下强制按 `client_name` 隔离命名空间。 | **P3** |
 | **R3.3** | **90 天真实生产运行基准报告** | 在个人工作站与家庭 NAS 上连续运行 EdgeCat + PatchCat，采集真实生产指标（本地 7B 承接率、TTFT 超时降级率、节省的云端 Token 成本、PII 拦截次数），沉淀技术复盘长文。 | **P2** |
 
