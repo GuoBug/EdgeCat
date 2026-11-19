@@ -16,7 +16,9 @@ docs/
     ├── 0001-openai-wire-protocol.md                   # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (EN)
     ├── 0001-openai-wire-protocol_zh.md                # ADR-0001: OpenAI Wire Protocol vs Custom/OpenAPI (ZH)
     ├── 0002-positioning-and-homelab-governance.md     # ADR-0002: Homelab LAN Sharing, Positioning & Threat Model (EN)
-    └── 0002-positioning-and-homelab-governance_zh.md  # ADR-0002: 治理网关定位、家庭/内网共享与安全威胁模型 (ZH)
+    ├── 0002-positioning-and-homelab-governance_zh.md  # ADR-0002: 治理网关定位、家庭/内网共享与安全威胁模型 (ZH)
+    ├── 0003-two-stage-request-mutator.md              # ADR-0003: Two-Stage RequestMutator Inbound Hook (EN)
+    └── 0003-two-stage-request-mutator_zh.md           # ADR-0003: 双阶段入站扩展接口 RequestMutator (ZH)
 ```
 
 ## Guidelines for Future Agents & Contributors

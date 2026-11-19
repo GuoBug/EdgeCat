@@ -176,14 +176,15 @@ EdgeCat 兼容 **OpenAI ChatCompletion 协议** 的基础对话与工具调用�
 - **协议覆盖范围**：`tools` / `tool_choice` / `tool_calls` / `reasoning_content` / 多模态 `content` 数组 / `temperature` / `top_p` / `max_tokens` / `seed` 等字段均可无损透传。
 - **尚未实现**：`/v1/embeddings`、`/v1/completions`、`/v1/responses` 等其它端点（请求返回 404）。
 - **`GET /health`**：最小化免鉴权探活端点（仅返回 `{"status":"healthy"}`），不泄露上游端点、客户端身份或配额数据。
-- **`GET /admin/status`**（别名 `/v1/admin/status`）：需通过鉴权后访问的运维视图，返回本地/云端配置状态、并发占用、熔断器状态、`clients_usage`、`next_quota_reset` 及异步审计吞吐指标。
+- **`GET /admin/status`**（别名 `/v1/admin/status`）：需通过鉴权后访问的运维视图，返回本地/云端配置状态、并发占用、熔断器状态、`clients_usage`、`next_quota_reset`、已挂载的 `mutators` 列表及异步审计吞吐指标。
 - **`GET /v1/models`**：提供 OpenAI 兼容的逻辑模型列表发现（不泄露后端物理模型名）。
 
 > 💡 **架构决策与演进路线沉淀**：
 > - [本地测试与验证指南 (Testing Guide)](docs/testing_guide_zh.md)（单元测试、全链路 Mock、cURL 手工验证与客户端接入）
 > - [ADR-0001: 采用 OpenAI 兼容协议作为核心通信协议](docs/adr/0001-openai-wire-protocol_zh.md)（OpenAI Wire Protocol 与 OpenAPI 概念辨析）
 > - [ADR-0002: 确立“治理网关本体 + 家庭/小团队内网共享”定位与安全威胁模型](docs/adr/0002-positioning-and-homelab-governance_zh.md)（为什么网关是本体、NAS 局域网共享边界与零落盘威胁模型）
-> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（Phase 1.5 已完成项、Phase 2 内网多端鉴权/云端降级配额规划，以及 5 项开工前待定的设计约束）
+> - [ADR-0003: 双阶段入站扩展接口 `RequestMutator` 设计](docs/adr/0003-two-stage-request-mutator_zh.md)（`StagePreMask` + `StagePostMask` 插件契约、安全不变量与 Go 挂载示例）
+> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（已完成 Phase 1/1.5/2 与 R3.1 里程碑，以及 Phase 3 后续储备规划）
 
 ---
 

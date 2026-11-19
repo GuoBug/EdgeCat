@@ -178,14 +178,15 @@ EdgeCat is wire-compatible with the **OpenAI ChatCompletion Protocol** for chat 
 - **Protocol coverage**: `tools` / `tool_choice` / `tool_calls` / `reasoning_content` / multimodal `content` arrays / `temperature` / `top_p` / `max_tokens` / `seed` are all forwarded losslessly.
 - **Not implemented**: `/v1/embeddings`, `/v1/completions`, `/v1/responses` (these return 404).
 - **`GET /health`**: Minimal unauthenticated liveness probe (`{"status":"healthy"}`); does not expose upstream endpoints, client identities, or quota counters.
-- **`GET /admin/status`** (alias `/v1/admin/status`): Authenticated operational view exposing local/cloud configuration status, concurrency slots, circuit breaker state, `clients_usage`, `next_quota_reset`, and audit throughput.
+- **`GET /admin/status`** (alias `/v1/admin/status`): Authenticated operational view exposing local/cloud configuration status, concurrency slots, circuit breaker state, `clients_usage`, `next_quota_reset`, registered `mutators`, and audit throughput.
 - **`GET /v1/models`**: Provides OpenAI-compatible logical model catalog discovery (without leaking physical backend model names).
 
 > 💡 **Architecture Decision Records & Roadmap**:
 > - [Testing & Verification Guide](docs/testing_guide.md) (Automated test suites, end-to-end mocks, cURL inspection, client pairing)
 > - [ADR-0001: Adoption of OpenAI-Compatible Wire Protocol](docs/adr/0001-openai-wire-protocol.md) (Wire Protocol vs. OpenAPI/Swagger disambiguation)
 > - [ADR-0002: Product Positioning, Homelab LAN Sharing & Threat Model](docs/adr/0002-positioning-and-homelab-governance.md) ("Gateway as Core, Hub as Usage", NAS LAN sharing boundaries, and zero-disk PII threat model)
-> - [EdgeCat Requirements Backlog & Evolution Roadmap](docs/roadmap.md) (Completed Phase 1.5 core, Phase 2 LAN sub-token/cloud-fallback quota specifications, and 5 open design constraints to resolve before coding)
+> - [ADR-0003: Two-Stage `RequestMutator` Inbound Extension Hook](docs/adr/0003-two-stage-request-mutator.md) (`StagePreMask` + `StagePostMask` plugin contract, security invariants, and Go usage example)
+> - [EdgeCat Requirements Backlog & Evolution Roadmap](docs/roadmap.md) (Completed Phase 1/1.5/2 & R3.1 milestones, plus Phase 3 backlog)
 
 ---
 
