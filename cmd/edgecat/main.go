@@ -20,6 +20,7 @@ import (
 	"github.com/patchcat-dev/edgecat/internal/config"
 	"github.com/patchcat-dev/edgecat/internal/contract"
 	"github.com/patchcat-dev/edgecat/internal/filter"
+	"github.com/patchcat-dev/edgecat/internal/memory"
 	"github.com/patchcat-dev/edgecat/internal/proxy"
 	"github.com/patchcat-dev/edgecat/internal/quota"
 	"github.com/patchcat-dev/edgecat/internal/router"
@@ -99,8 +100,30 @@ func main() {
 	}
 	defer quotaMgr.Close()
 
-	// 7. Initialize Proxy Handler
-	handler := proxy.NewHandler(cfg, masker, r, guard, auditLogger, quotaMgr)
+	// 7. Optional: Initialize Opt-In Layered Memory Plugin (R3.2, disabled by default)
+	var handlerOpts []proxy.HandlerOption
+	var memPlugin *memory.Plugin
+	if cfg.Memory.Enabled {
+		memPlugin, err = memory.NewPlugin(memory.Options{
+			SQLitePath:         cfg.Memory.SQLitePath,
+			MaxFacts:           cfg.Memory.MaxFacts,
+			MaxShortTerm:       cfg.Memory.MaxShortTerm,
+			QueryTimeoutMs:     cfg.Memory.QueryTimeoutMs,
+			ReaderMaxOpenConns: cfg.Memory.ReaderMaxOpenConns,
+			Masker:             masker,
+			HMACSecret:         []byte(cfg.Filter.HMACSecret),
+		})
+		if err != nil {
+			log.Fatalf("[Init] Failed to initialize layered memory plugin: %v", err)
+		}
+		defer func() { _ = memPlugin.Close() }()
+		handlerOpts = append(handlerOpts, proxy.WithRequestMutators(memPlugin))
+		log.Printf("[Init] Opt-in layered memory plugin enabled at %s (max_facts=%d, query_timeout=%dms)",
+			cfg.Memory.SQLitePath, cfg.Memory.MaxFacts, cfg.Memory.QueryTimeoutMs)
+	}
+
+	// 8. Initialize Proxy Handler
+	handler := proxy.NewHandler(cfg, masker, r, guard, auditLogger, quotaMgr, handlerOpts...)
 
 	mux := http.NewServeMux()
 	mux.Handle("/", handler)
@@ -129,6 +152,9 @@ func main() {
 	select {
 	case err := <-errCh:
 		log.Printf("[Server] HTTP server encountered fatal error: %v", err)
+		if memPlugin != nil {
+			_ = memPlugin.Close()
+		}
 		quotaMgr.Close()
 		_ = auditLogger.Close()
 		os.Exit(1)

@@ -67,6 +67,7 @@ filter:
   mask_idcard: false
   mask_bankcard: false
   block_apikey_tool_rehydrate: true
+  # hmac_secret: "${EDGECAT_PII_HMAC_SECRET}"  # Optional: enables cross-request HMAC-SHA256 stable PII keys
 
 contract:
   strict_json_enabled: true
@@ -78,3 +79,12 @@ audit:
   batch_size: 50
   flush_interval_ms: 1000
   queue_size: 10000
+
+# Optional: Opt-in Layered Memory RequestMutator plugin (R3.2, disabled by default)
+memory:
+  enabled: false
+  sqlite_path: "data/edgecat_memory.db"
+  max_facts: 5
+  max_short_term: 3
+  query_timeout_ms: 50
+  reader_max_open_conns: 4

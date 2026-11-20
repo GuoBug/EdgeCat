@@ -27,6 +27,7 @@ type Config struct {
 	Filter   FilterConfig   `yaml:"filter" json:"filter"`
 	Contract ContractConfig `yaml:"contract" json:"contract"`
 	Audit    AuditConfig    `yaml:"audit" json:"audit"`
+	Memory   MemoryConfig   `yaml:"memory" json:"memory"`
 }
 
 // ServerConfig configures the inbound HTTP server.
@@ -91,6 +92,9 @@ type FilterConfig struct {
 	MaskIDCard               bool   `yaml:"mask_idcard" json:"mask_idcard"`
 	MaskBankCard             bool   `yaml:"mask_bankcard" json:"mask_bankcard"`
 	BlockAPIKeyToolRehydrate bool   `yaml:"block_apikey_tool_rehydrate" json:"block_apikey_tool_rehydrate"`
+	// HMACSecret optionally upgrades sequential PII placeholders ({{EC_PII_PHONE_1}})
+	// to deterministic cross-request HMAC-SHA256 stable keys ({{EC_PII_PHONE_<16hex>}}).
+	HMACSecret string `yaml:"hmac_secret" json:"hmac_secret"`
 }
 
 // ContractConfig configures response contract validation and JSON guard.
@@ -106,6 +110,17 @@ type AuditConfig struct {
 	BatchSize       int    `yaml:"batch_size" json:"batch_size"`
 	FlushIntervalMs int    `yaml:"flush_interval_ms" json:"flush_interval_ms"`
 	QueueSize       int    `yaml:"queue_size" json:"queue_size"`
+}
+
+// MemoryConfig configures the opt-in layered memory RequestMutator plugin (R3.2).
+// Disabled by default to preserve EdgeCat's stateless gateway baseline.
+type MemoryConfig struct {
+	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	SQLitePath         string `yaml:"sqlite_path" json:"sqlite_path"`
+	MaxFacts           int    `yaml:"max_facts" json:"max_facts"`
+	MaxShortTerm       int    `yaml:"max_short_term" json:"max_short_term"`
+	QueryTimeoutMs     int    `yaml:"query_timeout_ms" json:"query_timeout_ms"`
+	ReaderMaxOpenConns int    `yaml:"reader_max_open_conns" json:"reader_max_open_conns"`
 }
 
 // DefaultConfig returns a sane default configuration.
@@ -168,6 +183,14 @@ func DefaultConfig() *Config {
 			BatchSize:       50,
 			FlushIntervalMs: 1000,
 			QueueSize:       10000,
+		},
+		Memory: MemoryConfig{
+			Enabled:            false,
+			SQLitePath:         "data/edgecat_memory.db",
+			MaxFacts:           5,
+			MaxShortTerm:       3,
+			QueryTimeoutMs:     50,
+			ReaderMaxOpenConns: 4,
 		},
 	}
 }

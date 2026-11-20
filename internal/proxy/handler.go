@@ -387,7 +387,12 @@ func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// 1. PII Policy Evaluation & Eager Masking (when policy == mask_always)
-	vault := filter.NewVault()
+	var vault *filter.Vault
+	if h.cfg.Filter.HMACSecret != "" {
+		vault = filter.NewStableVault([]byte(h.cfg.Filter.HMACSecret))
+	} else {
+		vault = filter.NewVault()
+	}
 	if h.cfg.Filter.Enabled && h.masker != nil {
 		switch piiPolicy {
 		case "block":

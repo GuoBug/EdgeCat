@@ -8,6 +8,9 @@ package filter
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -35,8 +38,9 @@ const (
 )
 
 var (
-	// Placeholder regex for rehydration replacement: {{EC_PII_<TYPE>_<INDEX>}}
-	rePlaceholder = regexp.MustCompile(`\{\{EC_PII_[A-Z0-9]+_\d+\}\}`)
+	// Placeholder regex for rehydration replacement:
+	// supports both sequential ({{EC_PII_PHONE_1}}) and HMAC stable keys ({{EC_PII_PHONE_a1b2c3d4e5f60718}}).
+	rePlaceholder = regexp.MustCompile(`\{\{EC_PII_[A-Z0-9]+_[A-Za-z0-9]+\}\}`)
 
 	// Chinese mobile numbers (optional +86/86 prefix, optional space/hyphen separators)
 	rePhone = regexp.MustCompile(`(?:(?:\+86|86)[- ]?|\b)1[3-9]\d[- ]?\d{4}[- ]?\d{4}\b`)
@@ -63,16 +67,38 @@ type Vault struct {
 	forward       map[string]string // original -> placeholder
 	reverse       map[string]string // placeholder -> original
 	typeCounters  map[string]int    // type -> next index
+	hmacKey       []byte            // optional local secret for cross-request stable keys
 	redactedCount int
 }
 
-// NewVault initializes a new request-scoped PII vault.
+// NewVault initializes a new request-scoped PII vault with sequential placeholders.
 func NewVault() *Vault {
 	return &Vault{
 		forward:      make(map[string]string),
 		reverse:      make(map[string]string),
 		typeCounters: make(map[string]int),
 	}
+}
+
+// NewStableVault initializes a PII vault that derives deterministic cross-request
+// placeholder keys from the first 8 bytes (16 hex chars) of HMAC-SHA256(original, secret).
+// If secret is empty, it falls back to sequential indexing like NewVault.
+func NewStableVault(secret []byte) *Vault {
+	v := NewVault()
+	if len(secret) > 0 {
+		v.hmacKey = make([]byte, len(secret))
+		copy(v.hmacKey, secret)
+	}
+	return v
+}
+
+// StableKey computes the 16-character hex digest of the first 8 bytes of
+// HMAC-SHA256(original, secret) for deterministic cross-request PII correlation.
+func StableKey(original string, secret []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(original))
+	sum := mac.Sum(nil)
+	return hex.EncodeToString(sum[:8])
 }
 
 // Mask returns an existing placeholder or allocates a new deterministic placeholder for the value.
@@ -84,9 +110,14 @@ func (v *Vault) Mask(piiType, original string) string {
 		return placeholder
 	}
 
-	v.typeCounters[piiType]++
-	index := v.typeCounters[piiType]
-	placeholder := fmt.Sprintf("%s%s_%d%s", PlaceholderPrefix, piiType, index, PlaceholderSuffix)
+	var placeholder string
+	if len(v.hmacKey) > 0 {
+		placeholder = fmt.Sprintf("%s%s_%s%s", PlaceholderPrefix, piiType, StableKey(original, v.hmacKey), PlaceholderSuffix)
+	} else {
+		v.typeCounters[piiType]++
+		index := v.typeCounters[piiType]
+		placeholder = fmt.Sprintf("%s%s_%d%s", PlaceholderPrefix, piiType, index, PlaceholderSuffix)
+	}
 
 	v.forward[original] = placeholder
 	v.reverse[placeholder] = original

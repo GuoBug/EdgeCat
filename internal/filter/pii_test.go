@@ -257,3 +257,45 @@ func TestMasker_IDCard_BankCard_And_APIKeyToolGuard(t *testing.T) {
 		t.Fatalf("expected APIKEY to stay redacted in tool args, got %s", safeToolArgs)
 	}
 }
+
+func TestStableVault_HMACKeyDeterminismAndStreamingRehydration(t *testing.T) {
+	secret := []byte("edgecat-local-homelab-secret-key")
+	masker := filter.NewMasker(true, true, true, true)
+
+	v1 := filter.NewStableVault(secret)
+	v2 := filter.NewStableVault(secret)
+	vOther := filter.NewStableVault([]byte("different-secret"))
+
+	input := "Call 13800138000 now"
+	m1 := masker.MaskText(input, v1)
+	m2 := masker.MaskText(input, v2)
+	mOther := masker.MaskText(input, vOther)
+
+	expectedKey := filter.StableKey("13800138000", secret)
+	if len(expectedKey) != 16 {
+		t.Fatalf("expected 16 hex chars (8 bytes), got %d (%q)", len(expectedKey), expectedKey)
+	}
+	expectedPh := "{{EC_PII_PHONE_" + expectedKey + "}}"
+
+	if m1 != "Call "+expectedPh+" now" {
+		t.Fatalf("unexpected stable placeholder: got %q, want %q", m1, "Call "+expectedPh+" now")
+	}
+	if m1 != m2 {
+		t.Fatalf("expected identical placeholders across requests, got %q vs %q", m1, m2)
+	}
+	if m1 == mOther {
+		t.Fatalf("different secrets must produce different stable keys: %q", m1)
+	}
+
+	// Verify sliding-window SSE rehydration when a 16-hex stable key is split across chunks.
+	rehydrator := filter.NewSlidingRehydrator(v1)
+	splitAt := len("Call {{EC_PII_PHONE_") + 6
+	var out strings.Builder
+	out.WriteString(rehydrator.Feed(m1[:splitAt]))
+	out.WriteString(rehydrator.Feed(m1[splitAt:]))
+	out.WriteString(rehydrator.Flush())
+
+	if out.String() != input {
+		t.Fatalf("streaming rehydration failed for stable key: got %q, want %q", out.String(), input)
+	}
+}
