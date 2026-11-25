@@ -204,7 +204,7 @@ func NewPlugin(opts Options) (*Plugin, error) {
 		return nil, fmt.Errorf("init memory schema: %w", err)
 	}
 
-	readerDSN := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=query_only(ON)&_pragma=busy_timeout(5000)", opts.SQLitePath)
+	readerDSN := fmt.Sprintf("%s?_pragma=query_only(ON)&_pragma=busy_timeout(5000)", opts.SQLitePath)
 	readerDB, err := sql.Open("sqlite", readerDSN)
 	if err != nil {
 		_ = writerDB.Close()
@@ -212,6 +212,25 @@ func NewPlugin(opts Options) (*Plugin, error) {
 	}
 	readerDB.SetMaxOpenConns(opts.ReaderMaxOpenConns)
 	readerDB.SetMaxIdleConns(opts.ReaderMaxOpenConns)
+
+	// Pre-warm the read-only connection pool at startup so cold SQLite schema
+	// parsing never consumes the 50ms StagePreMask TTFT budget on initial bursts.
+	warmConns := make([]*sql.Conn, 0, opts.ReaderMaxOpenConns)
+	for i := 0; i < opts.ReaderMaxOpenConns; i++ {
+		c, err := readerDB.Conn(context.Background())
+		if err != nil {
+			for _, wc := range warmConns {
+				_ = wc.Close()
+			}
+			_ = readerDB.Close()
+			_ = writerDB.Close()
+			return nil, fmt.Errorf("warm memory reader pool: %w", err)
+		}
+		warmConns = append(warmConns, c)
+	}
+	for _, wc := range warmConns {
+		_ = wc.Close()
+	}
 
 	var secretCopy []byte
 	if len(opts.HMACSecret) > 0 {

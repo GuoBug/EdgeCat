@@ -212,9 +212,10 @@ func TestLayeredMemory_EndToEndProxyMutatorIntegration(t *testing.T) {
 	guard := contract.NewGuard(false, 1, 5000)
 
 	memPlugin, err := memory.NewPlugin(memory.Options{
-		SQLitePath: filepath.Join(tmpDir, "memory.db"),
-		Masker:     masker,
-		HMACSecret: []byte(cfg.Filter.HMACSecret),
+		SQLitePath:     filepath.Join(tmpDir, "memory.db"),
+		QueryTimeoutMs: 500,
+		Masker:         masker,
+		HMACSecret:     []byte(cfg.Filter.HMACSecret),
 	})
 	if err != nil {
 		t.Fatalf("memory plugin: %v", err)
@@ -444,6 +445,7 @@ func TestLayeredMemory_TwoZonePrefixCacheDeterminism_And_FallbackToggle(t *testi
 		MaxPinnedFacts: 10,
 		MaxFacts:       5,
 		MaxShortTerm:   3,
+		QueryTimeoutMs: 500,
 	})
 	if err != nil {
 		t.Fatalf("NewPlugin: %v", err)
@@ -536,6 +538,7 @@ func TestLayeredMemory_TwoZonePrefixCacheDeterminism_And_FallbackToggle(t *testi
 	// Verify PrependDynamicContext compatibility escape hatch places both zones at the front.
 	fallbackPlugin, err := memory.NewPlugin(memory.Options{
 		SQLitePath:            dbPath,
+		QueryTimeoutMs:        500,
 		PrependDynamicContext: true,
 	})
 	if err != nil {
@@ -558,6 +561,7 @@ func TestLayeredMemory_Dormancy_QuoteGuard_And_ConcurrentAsyncHitTracking(t *tes
 	dbPath := filepath.Join(t.TempDir(), "dormancy_race.db")
 	plugin, err := memory.NewPlugin(memory.Options{
 		SQLitePath:         dbPath,
+		QueryTimeoutMs:     2000,
 		HitQueueSize:       256,
 		HitFlushIntervalMs: 25,
 	})
@@ -671,6 +675,7 @@ func TestLayeredMemory_Dormancy_QuoteGuard_And_ConcurrentAsyncHitTracking(t *tes
 	// 4. Stress concurrent MutatePreMask racing directly against Close() with tiny queue size (drop path + race safety).
 	tinyPlugin, err := memory.NewPlugin(memory.Options{
 		SQLitePath:         dbPath,
+		QueryTimeoutMs:     2000,
 		HitQueueSize:       2,
 		HitFlushIntervalMs: 500,
 	})
