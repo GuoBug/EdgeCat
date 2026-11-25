@@ -71,7 +71,9 @@ audit:
 memory:
   enabled: false
   sqlite_path: "/var/lib/edgecat/edgecat_memory.db"
+  max_pinned_facts: 10
   max_facts: 5
   max_short_term: 3
   query_timeout_ms: 50
   reader_max_open_conns: 4
+  prepend_dynamic_context: false

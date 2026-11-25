@@ -112,15 +112,17 @@ type AuditConfig struct {
 	QueueSize       int    `yaml:"queue_size" json:"queue_size"`
 }
 
-// MemoryConfig configures the opt-in layered memory RequestMutator plugin (R3.2).
+// MemoryConfig configures the opt-in layered memory RequestMutator plugin (R3.2 / R3.2.1).
 // Disabled by default to preserve EdgeCat's stateless gateway baseline.
 type MemoryConfig struct {
-	Enabled            bool   `yaml:"enabled" json:"enabled"`
-	SQLitePath         string `yaml:"sqlite_path" json:"sqlite_path"`
-	MaxFacts           int    `yaml:"max_facts" json:"max_facts"`
-	MaxShortTerm       int    `yaml:"max_short_term" json:"max_short_term"`
-	QueryTimeoutMs     int    `yaml:"query_timeout_ms" json:"query_timeout_ms"`
-	ReaderMaxOpenConns int    `yaml:"reader_max_open_conns" json:"reader_max_open_conns"`
+	Enabled               bool   `yaml:"enabled" json:"enabled"`
+	SQLitePath            string `yaml:"sqlite_path" json:"sqlite_path"`
+	MaxPinnedFacts        int    `yaml:"max_pinned_facts" json:"max_pinned_facts"`
+	MaxFacts              int    `yaml:"max_facts" json:"max_facts"`
+	MaxShortTerm          int    `yaml:"max_short_term" json:"max_short_term"`
+	QueryTimeoutMs        int    `yaml:"query_timeout_ms" json:"query_timeout_ms"`
+	ReaderMaxOpenConns    int    `yaml:"reader_max_open_conns" json:"reader_max_open_conns"`
+	PrependDynamicContext bool   `yaml:"prepend_dynamic_context" json:"prepend_dynamic_context"`
 }
 
 // DefaultConfig returns a sane default configuration.
@@ -185,12 +187,14 @@ func DefaultConfig() *Config {
 			QueueSize:       10000,
 		},
 		Memory: MemoryConfig{
-			Enabled:            false,
-			SQLitePath:         "data/edgecat_memory.db",
-			MaxFacts:           5,
-			MaxShortTerm:       3,
-			QueryTimeoutMs:     50,
-			ReaderMaxOpenConns: 4,
+			Enabled:               false,
+			SQLitePath:            "data/edgecat_memory.db",
+			MaxPinnedFacts:        10,
+			MaxFacts:              5,
+			MaxShortTerm:          3,
+			QueryTimeoutMs:        50,
+			ReaderMaxOpenConns:    4,
+			PrependDynamicContext: false,
 		},
 	}
 }
@@ -357,5 +361,23 @@ func applySanityChecks(cfg *Config) {
 	}
 	if cfg.Audit.SQLitePath == "" {
 		cfg.Audit.SQLitePath = "data/edgecat_audit.db"
+	}
+	if cfg.Memory.MaxPinnedFacts <= 0 {
+		cfg.Memory.MaxPinnedFacts = 10
+	}
+	if cfg.Memory.MaxFacts <= 0 {
+		cfg.Memory.MaxFacts = 5
+	}
+	if cfg.Memory.MaxShortTerm <= 0 {
+		cfg.Memory.MaxShortTerm = 3
+	}
+	if cfg.Memory.QueryTimeoutMs <= 0 {
+		cfg.Memory.QueryTimeoutMs = 50
+	}
+	if cfg.Memory.ReaderMaxOpenConns <= 0 {
+		cfg.Memory.ReaderMaxOpenConns = 4
+	}
+	if cfg.Memory.SQLitePath == "" {
+		cfg.Memory.SQLitePath = "data/edgecat_memory.db"
 	}
 }

@@ -135,6 +135,42 @@ func (r *Request) AppendMessage(role, content string) {
 	r.fields["messages"] = updated
 }
 
+// InsertSystemBeforeLastUser inserts a system role message immediately before
+// the last role=="user" message in messages. If no user message exists, the
+// system message is appended to the end. This preserves byte-identical history
+// prefixes (messages[0..lastUserIdx-1]) across multi-turn conversations so
+// upstream KV / Prefix Caches stay warm.
+func (r *Request) InsertSystemBeforeLastUser(content string) {
+	existing := r.Messages()
+	sysMsg := map[string]any{
+		"role":    "system",
+		"content": content,
+	}
+
+	lastUserIdx := -1
+	for i := len(existing) - 1; i >= 0; i-- {
+		m, ok := existing[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		if role, _ := m["role"].(string); role == "user" {
+			lastUserIdx = i
+			break
+		}
+	}
+
+	updated := make([]any, 0, len(existing)+1)
+	if lastUserIdx < 0 {
+		updated = append(updated, existing...)
+		updated = append(updated, sysMsg)
+	} else {
+		updated = append(updated, existing[:lastUserIdx]...)
+		updated = append(updated, sysMsg)
+		updated = append(updated, existing[lastUserIdx:]...)
+	}
+	r.fields["messages"] = updated
+}
+
 // Marshal re-encodes the request. HTML escaping is disabled so that payloads are
 // forwarded byte-similar to what the client sent.
 func (r *Request) Marshal() ([]byte, error) {

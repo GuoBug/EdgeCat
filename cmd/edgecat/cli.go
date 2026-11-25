@@ -169,10 +169,12 @@ audit:
 memory:
   enabled: false
   sqlite_path: %q
+  max_pinned_facts: 10
   max_facts: 5
   max_short_term: 3
   query_timeout_ms: 50
   reader_max_open_conns: 4
+  prepend_dynamic_context: false
 `, host, authEnabled, workstationToken, familyToken, localEndpoint, auditPath, memoryPath)
 
 	if dir := filepath.Dir(*outPath); dir != "." && dir != "" {

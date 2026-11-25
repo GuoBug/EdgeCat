@@ -298,3 +298,54 @@ func TestRequestMutator_WithOptionAndAdminStatusObservability(t *testing.T) {
 		t.Fatalf("expected mutators %v in /admin/status, got %v", want, body.Mutators)
 	}
 }
+
+func TestRequest_InsertSystemBeforeLastUser(t *testing.T) {
+	t.Run("MultiTurnPreservesHistoryPrefix", func(t *testing.T) {
+		raw := `{
+			"model": "default",
+			"messages": [
+				{"role": "system", "content": "base system"},
+				{"role": "user", "content": "turn 1 question"},
+				{"role": "assistant", "content": "turn 1 answer"},
+				{"role": "user", "content": "turn 2 question"}
+			]
+		}`
+		req, err := proxy.ParseRequest([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseRequest: %v", err)
+		}
+		origPrefix := append([]any(nil), req.Messages()[:3]...)
+
+		req.InsertSystemBeforeLastUser("[EdgeCat Dynamic Context]\n- fact")
+		msgs := req.Messages()
+		if len(msgs) != 5 {
+			t.Fatalf("expected 5 messages, got %d", len(msgs))
+		}
+		if !reflect.DeepEqual(msgs[:3], origPrefix) {
+			t.Fatalf("expected messages[0..2] unchanged, got %+v", msgs[:3])
+		}
+		injected := msgs[3].(map[string]any)
+		if injected["role"] != "system" || !strings.Contains(injected["content"].(string), "Dynamic Context") {
+			t.Fatalf("expected injected system message at index 3, got %+v", injected)
+		}
+		last := msgs[4].(map[string]any)
+		if last["role"] != "user" || last["content"] != "turn 2 question" {
+			t.Fatalf("expected last user message at index 4, got %+v", last)
+		}
+	})
+
+	t.Run("NoUserMessageAppendsToEnd", func(t *testing.T) {
+		req, err := proxy.ParseRequest([]byte(`{"model":"default","messages":[{"role":"system","content":"only sys"}]}`))
+		if err != nil {
+			t.Fatalf("ParseRequest: %v", err)
+		}
+		req.InsertSystemBeforeLastUser("tail context")
+		msgs := req.Messages()
+		if len(msgs) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(msgs))
+		}
+		if msgs[0].(map[string]any)["content"] != "only sys" || msgs[1].(map[string]any)["content"] != "tail context" {
+			t.Fatalf("unexpected message order: %+v", msgs)
+		}
+	})
+}

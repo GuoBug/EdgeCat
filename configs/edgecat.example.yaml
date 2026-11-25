@@ -80,11 +80,13 @@ audit:
   flush_interval_ms: 1000
   queue_size: 10000
 
-# Optional: Opt-in Layered Memory RequestMutator plugin (R3.2, disabled by default)
+# Optional: Opt-in Layered Memory RequestMutator plugin (R3.2 / R3.2.1, disabled by default)
 memory:
   enabled: false
   sqlite_path: "data/edgecat_memory.db"
-  max_facts: 5
-  max_short_term: 3
-  query_timeout_ms: 50
-  reader_max_open_conns: 4
+  max_pinned_facts: 10            # Zone 1 deterministic static prefix cap (id ASC at messages[0])
+  max_facts: 5                    # Zone 2 dynamic FTS5 retrieval cap (inserted before last user message)
+  max_short_term: 3               # Zone 2 recent rolling summaries cap
+  query_timeout_ms: 50            # Fail-open retrieval timeout budget (ms)
+  reader_max_open_conns: 4        # Read-only SQLite pool size for concurrent retrieval
+  prepend_dynamic_context: false  # Set true ONLY if upstream chat template rejects mid-conversation system messages

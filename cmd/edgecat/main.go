@@ -133,26 +133,28 @@ func main() {
 	}
 	defer quotaMgr.Close()
 
-	// 7. Optional: Initialize Opt-In Layered Memory Plugin (R3.2, disabled by default)
+	// 7. Optional: Initialize Opt-In Layered Memory Plugin (R3.2 / R3.2.1, disabled by default)
 	var handlerOpts []proxy.HandlerOption
 	var memPlugin *memory.Plugin
 	if cfg.Memory.Enabled {
 		memPlugin, err = memory.NewPlugin(memory.Options{
-			SQLitePath:         cfg.Memory.SQLitePath,
-			MaxFacts:           cfg.Memory.MaxFacts,
-			MaxShortTerm:       cfg.Memory.MaxShortTerm,
-			QueryTimeoutMs:     cfg.Memory.QueryTimeoutMs,
-			ReaderMaxOpenConns: cfg.Memory.ReaderMaxOpenConns,
-			Masker:             masker,
-			HMACSecret:         []byte(cfg.Filter.HMACSecret),
+			SQLitePath:            cfg.Memory.SQLitePath,
+			MaxPinnedFacts:        cfg.Memory.MaxPinnedFacts,
+			MaxFacts:              cfg.Memory.MaxFacts,
+			MaxShortTerm:          cfg.Memory.MaxShortTerm,
+			QueryTimeoutMs:        cfg.Memory.QueryTimeoutMs,
+			ReaderMaxOpenConns:    cfg.Memory.ReaderMaxOpenConns,
+			PrependDynamicContext: cfg.Memory.PrependDynamicContext,
+			Masker:                masker,
+			HMACSecret:            []byte(cfg.Filter.HMACSecret),
 		})
 		if err != nil {
 			log.Fatalf("[Init] Failed to initialize layered memory plugin: %v", err)
 		}
 		defer func() { _ = memPlugin.Close() }()
 		handlerOpts = append(handlerOpts, proxy.WithRequestMutators(memPlugin))
-		log.Printf("[Init] Opt-in layered memory plugin enabled at %s (max_facts=%d, query_timeout=%dms)",
-			cfg.Memory.SQLitePath, cfg.Memory.MaxFacts, cfg.Memory.QueryTimeoutMs)
+		log.Printf("[Init] Opt-in layered memory plugin enabled at %s (max_pinned=%d, max_facts=%d, query_timeout=%dms)",
+			cfg.Memory.SQLitePath, cfg.Memory.MaxPinnedFacts, cfg.Memory.MaxFacts, cfg.Memory.QueryTimeoutMs)
 	}
 
 	// 8. Initialize Proxy Handler
