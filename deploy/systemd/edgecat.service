@@ -1,0 +1,40 @@
+# EdgeCat systemd unit for Linux Workstations / Home NAS (Debian, Ubuntu, PVE, Arch)
+#
+# Install steps:
+#   1. sudo cp bin/edgecat /usr/local/bin/edgecat && sudo chmod 0755 /usr/local/bin/edgecat
+#   2. sudo useradd --system --no-create-home --shell /usr/sbin/nologin edgecat || true
+#   3. sudo mkdir -p /etc/edgecat /var/lib/edgecat
+#   4. sudo /usr/local/bin/edgecat init -lan -out /etc/edgecat/edgecat.yaml
+#      (update audit.sqlite_path in /etc/edgecat/edgecat.yaml to /var/lib/edgecat/edgecat_audit.db)
+#   5. sudo chown -R edgecat:edgecat /etc/edgecat /var/lib/edgecat
+#   6. sudo cp deploy/systemd/edgecat.service /etc/systemd/system/edgecat.service
+#   7. sudo systemctl daemon-reload && sudo systemctl enable --now edgecat
+
+[Unit]
+Description=EdgeCat Local-First AI Inference Governance Gateway
+Documentation=https://github.com/GuoBug/EdgeCat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edgecat
+Group=edgecat
+WorkingDirectory=/var/lib/edgecat
+EnvironmentFile=-/etc/edgecat/edgecat.env
+ExecStartPre=/usr/local/bin/edgecat check -config /etc/edgecat/edgecat.yaml -offline
+ExecStart=/usr/local/bin/edgecat serve -config /etc/edgecat/edgecat.yaml
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/edgecat
+ReadOnlyPaths=/etc/edgecat
+
+[Install]
+WantedBy=multi-user.target

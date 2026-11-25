@@ -1,10 +1,16 @@
-# Binaries
+# Binaries & release staging
 bin/
+dist/
+artifacts/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+
+# Local environment secrets & generated root config
+.env
+/edgecat.yaml
 
 # Test and coverage artifacts
 *.test

@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+  build-matrix:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build static binary & package archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          STAGE_NAME="edgecat_${VERSION}_${GOOS}_${GOARCH}"
+          STAGE_DIR="dist/${STAGE_NAME}"
+
+          mkdir -p "${STAGE_DIR}/configs" "${STAGE_DIR}/deploy"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}" \
+            -o "${STAGE_DIR}/edgecat${EXT}" ./cmd/edgecat
+
+          cp LICENSE README.md README_zh.md docker-compose.yml .env.example "${STAGE_DIR}/"
+          cp configs/edgecat.example.yaml configs/edgecat.docker.yaml "${STAGE_DIR}/configs/"
+          cp -r deploy/* "${STAGE_DIR}/deploy/"
+
+          mkdir -p artifacts
+          if [ "${ARCHIVE}" = "zip" ]; then
+            (cd dist && zip -qr "../artifacts/${STAGE_NAME}.zip" "${STAGE_NAME}")
+          else
+            tar -C dist -czf "artifacts/${STAGE_NAME}.tar.gz" "${STAGE_NAME}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edgecat-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: artifacts/*
+
+  publish-release:
+    needs: build-matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

@@ -16,7 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var reEnvRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+var reEnvRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`)
 
 // Config represents the complete gateway runtime configuration.
 type Config struct {
@@ -229,16 +229,28 @@ func expandEnvRefs(cfg *Config) {
 	expand := func(s string) string {
 		return reEnvRef.ReplaceAllStringFunc(s, func(match string) string {
 			sub := reEnvRef.FindStringSubmatch(match)
-			if len(sub) == 2 {
-				if val, ok := os.LookupEnv(sub[1]); ok {
+			if len(sub) >= 2 {
+				if val, ok := os.LookupEnv(sub[1]); ok && val != "" {
 					return val
+				}
+				// Support ${VAR:-default} fallback syntax when :- is present in match
+				if strings.Contains(match, ":-") && len(sub) >= 3 {
+					return sub[2]
 				}
 			}
 			return match
 		})
 	}
+	cfg.Local.Endpoint = expand(cfg.Local.Endpoint)
 	cfg.Local.APIKey = expand(cfg.Local.APIKey)
+	cfg.Cloud.Endpoint = expand(cfg.Cloud.Endpoint)
 	cfg.Cloud.APIKey = expand(cfg.Cloud.APIKey)
+	cfg.Filter.HMACSecret = expand(cfg.Filter.HMACSecret)
+	cfg.Audit.SQLitePath = expand(cfg.Audit.SQLitePath)
+	cfg.Memory.SQLitePath = expand(cfg.Memory.SQLitePath)
+	for i := range cfg.Auth.Clients {
+		cfg.Auth.Clients[i].Token = expand(cfg.Auth.Clients[i].Token)
+	}
 }
 
 func isValidPIIPolicy(p string) bool {
@@ -280,10 +292,17 @@ func Validate(cfg *Config) error {
 			if strings.TrimSpace(c.Token) == "" {
 				return fmt.Errorf("auth.clients[%d] token cannot be empty when auth is enabled", i)
 			}
+			if reEnvRef.MatchString(c.Token) {
+				return fmt.Errorf("auth.clients[%d] token contains unresolved environment variable %q", i, c.Token)
+			}
 			if !isValidPIIPolicy(c.PIIPolicy) {
 				return fmt.Errorf("auth.clients[%d] invalid pii_policy %q", i, c.PIIPolicy)
 			}
 		}
+	}
+
+	if reEnvRef.MatchString(cfg.Filter.HMACSecret) {
+		return fmt.Errorf("filter.hmac_secret contains unresolved environment variable %q", cfg.Filter.HMACSecret)
 	}
 
 	if !isValidPIIPolicy(cfg.Filter.Policy) {

@@ -39,11 +39,44 @@ const banner = `
   Copyright (c) 2026 Guo Qiang (Apache-2.0)
 `
 
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
+
 func main() {
-	configPath := flag.String("config", "configs/edgecat.example.yaml", "Path to YAML/JSON configuration file")
-	flag.Parse()
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "version", "-version", "--version", "-v":
+			fmt.Println(formatVersion())
+			return
+		case "help", "-h", "--help":
+			printUsage(os.Stdout)
+			return
+		case "init":
+			os.Exit(runInit(args[1:], os.Stdout, os.Stderr))
+		case "check":
+			os.Exit(runCheck(args[1:], os.Stdout, os.Stderr))
+		case "ping":
+			os.Exit(runPing(args[1:], os.Stdout, os.Stderr))
+		case "serve":
+			args = args[1:]
+		}
+	}
+
+	serveFlags := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := serveFlags.String("config", "configs/edgecat.example.yaml", "Path to YAML/JSON configuration file")
+	showVersion := serveFlags.Bool("version", false, "Print version and exit")
+	_ = serveFlags.Parse(args)
+	if *showVersion {
+		fmt.Println(formatVersion())
+		return
+	}
 
 	fmt.Print(banner)
+	log.Printf("[Init] %s", formatVersion())
 
 	// 1. Load configuration
 	log.Printf("[Init] Loading configuration from %s ...", *configPath)

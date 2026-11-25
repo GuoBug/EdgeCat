@@ -99,24 +99,45 @@
 
 ## 快速上手
 
-### 1. 编译
-本项目完全支持 `CGO_ENABLED=0` 纯静态编译：
+### 方式 A：单文件启动（个人工作站 / 本机或内网裸机）
+
+从 [GitHub Releases](https://github.com/GuoBug/EdgeCat/releases) 下载对应系统架构（Windows / macOS / Linux `amd64` & `arm64`）的纯静态单文件，或从源码编译（`CGO_ENABLED=0`）：
 ```bash
-# 生成纯静态无依赖可执行文件
 make build
-# 或直接执行：
+# 或直接编译：
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/edgecat ./cmd/edgecat
 ```
 
-### 2. 运行单元测试
+使用内置向导一键生成配置并做启动前体检：
 ```bash
-make test
-# 或执行：
-go test -v ./...
+# 1. 生成配置（默认本机回环模式；家庭/内网共享请加 -lan，自动生成随机强子令牌）
+./bin/edgecat init -out edgecat.yaml
+# ./bin/edgecat init -lan -out edgecat.yaml
+
+# 2. 启动前体检（校验 YAML 安全规约、SQLite 目录写权限，并探测本地/云端连通性；离线校验加 -offline）
+./bin/edgecat check -config edgecat.yaml
+
+# 3. 启动网关（查看版本可执行 ./bin/edgecat version）
+./bin/edgecat -config edgecat.yaml
 ```
 
-### 3. 配置与启动
-参考 `configs/edgecat.example.yaml` 编写配置文件：
+### 方式 B：Docker Compose 一键部署（家庭 NAS / Mac mini / 软路由）
+
+镜像基于 `scratch` 构建（零 Shell、非 root `65532:65532`、内置根证书与时区及 `/edgecat ping` 健康检查）：
+```bash
+# 1. 复制环境变量模板，设置必填的内网客户端子令牌 EDGECAT_CLIENT_TOKEN（及可选云端保底 Key）
+cp .env.example .env
+
+# 2. 后台构建并启动（自动通过 host.docker.internal 连接宿主机 Ollama，SQLite 持久化于命名卷）
+docker compose up -d
+```
+
+### 方式 C：系统常驻守护进程模板
+- **Linux (`systemd`)**：参考 [`deploy/systemd/edgecat.service`](deploy/systemd/edgecat.service)（内置 `ExecStartPre` 配置自检与最小权限沙箱隔离）。
+- **macOS (`launchd`)**：参考 [`deploy/launchd/dev.patchcat.edgecat.plist`](deploy/launchd/dev.patchcat.edgecat.plist)（适配 Mac mini 常驻网关或 MacBook 开机自启）。
+
+### 核心配置示例 (`configs/edgecat.example.yaml`)
+配置支持 `${ENV_VAR}` 与 `${ENV_VAR:-default}` 环境变量展开（鉴权开启时若令牌含未解析变量将拒绝启动）：
 ```yaml
 server:
   host: "127.0.0.1"
@@ -138,8 +159,8 @@ local:
     "gpt-4o-mini": "qwen2.5:7b"
 
 cloud:
-  endpoint: "https://api.openai.com/v1"
-  api_key: "sk-your-cloud-api-key"
+  endpoint: "${EDGECAT_CLOUD_ENDPOINT:-https://api.openai.com/v1}"
+  api_key: "${EDGECAT_CLOUD_API_KEY:-}"
   timeout_ms: 60000
   model_mapping:
     "default": "gpt-4o-mini"
@@ -160,11 +181,6 @@ audit:
   sqlite_path: "data/edgecat_audit.db"
   batch_size: 50
   flush_interval_ms: 1000
-```
-
-启动网关：
-```bash
-./bin/edgecat -config configs/edgecat.example.yaml
 ```
 
 ---

@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 480" width="960" height="480" style="background:#0b0f19; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;">
+  <defs>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#10b981"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrow-dashed" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#a855f7"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Card -->
+  <rect x="20" y="20" width="920" height="440" rx="14" fill="#0f172a" stroke="#334155" stroke-width="2" filter="url(#shadow)"/>
+
+  <!-- Header -->
+  <text x="50" y="58" fill="#f8fafc" font-size="19" font-weight="700" letter-spacing="0.5">EdgeCat 流式 SSE 滑动窗口脱敏与跨帧还原流程</text>
+  <text x="50" y="82" fill="#94a3b8" font-size="13">入站掩码存内存 ➔ 拦截跨帧截断残片 ➔ 双游标拼接还原 ➔ 零首字延迟刷出</text>
+  <line x1="50" y1="98" x2="910" y2="98" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- ================= STEP 1: 入站脱敏 (Left) ================= -->
+  <g transform="translate(50, 125)">
+    <rect x="0" y="0" width="180" height="165" rx="10" fill="#091914" stroke="#10b981" stroke-width="2"/>
+    <rect x="14" y="14" width="152" height="28" rx="5" fill="#065f46"/>
+    <text x="90" y="33" text-anchor="middle" fill="#ecfdf5" font-size="13" font-weight="700">1. 入站掩码</text>
+
+    <text x="90" y="68" text-anchor="middle" fill="#94a3b8" font-size="12">原始敏感输入</text>
+    <rect x="20" y="78" width="140" height="26" rx="4" fill="#1e293b"/>
+    <text x="90" y="96" text-anchor="middle" fill="#fca5a5" font-size="12" font-family="monospace">13800138000</text>
+
+    <text x="90" y="122" text-anchor="middle" fill="#10b981" font-size="12">▼ 替换占位符</text>
+    <rect x="14" y="130" width="152" height="24" rx="4" fill="#064e3b"/>
+    <text x="90" y="146" text-anchor="middle" fill="#6ee7b7" font-size="11.5" font-family="monospace">{{EC_PII_PHONE_1}}</text>
+  </g>
+
+  <!-- Arrow: Step 1 -> Vault (Down) -->
+  <path d="M 140 290 L 140 340" stroke="#a855f7" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow-dashed)"/>
+
+  <!-- Memory Vault (Bottom Left) -->
+  <g transform="translate(50, 348)">
+    <rect x="0" y="0" width="180" height="82" rx="10" fill="#1e1b4b" stroke="#a855f7" stroke-width="2"/>
+    <text x="90" y="28" text-anchor="middle" fill="#e9d5ff" font-size="13" font-weight="700">内存 Vault (零落盘)</text>
+    <text x="90" y="50" text-anchor="middle" fill="#c084fc" font-size="11.5" font-family="monospace">PHONE_1 ⇄ 138...000</text>
+    <text x="90" y="68" text-anchor="middle" fill="#94a3b8" font-size="11">单次请求结束即销毁</text>
+  </g>
+
+  <!-- Arrow: Step 1 -> Step 2 -->
+  <path d="M 230 207 L 272 207" stroke="#38bdf8" stroke-width="2.5" marker-end="url(#arrow-cyan)"/>
+
+  <!-- ================= STEP 2: 上游 SSE 分词截断 (Middle-Left) ================= -->
+  <g transform="translate(280, 125)">
+    <rect x="0" y="0" width="195" height="165" rx="10" fill="#18120b" stroke="#f59e0b" stroke-width="2"/>
+    <rect x="14" y="14" width="167" height="28" rx="5" fill="#b45309"/>
+    <text x="97" y="33" text-anchor="middle" fill="#fef3c7" font-size="13" font-weight="700">2. SSE 跨帧截断</text>
+
+    <text x="97" y="66" text-anchor="middle" fill="#94a3b8" font-size="12">大模型按 Token 吐出：</text>
+
+    <!-- Frame 1 -->
+    <rect x="14" y="78" width="167" height="32" rx="5" fill="#271c10" stroke="#d97706" stroke-width="1"/>
+    <text x="97" y="99" text-anchor="middle" fill="#fde68a" font-size="12" font-family="monospace">帧1: "号码：{{EC_PI"</text>
+
+    <!-- Frame 2 -->
+    <rect x="14" y="118" width="167" height="32" rx="5" fill="#271c10" stroke="#d97706" stroke-width="1"/>
+    <text x="97" y="139" text-anchor="middle" fill="#fdba74" font-size="12" font-family="monospace">帧2: "I_PHONE_1}}"</text>
+  </g>
+
+  <!-- Arrow: Step 2 -> Step 3 -->
+  <path d="M 475 207 L 517 207" stroke="#f59e0b" stroke-width="2.5" marker-end="url(#arrow-amber)"/>
+
+  <!-- ================= STEP 3: 双游标滑动窗口 (Middle-Right) ================= -->
+  <g transform="translate(525, 125)">
+    <rect x="0" y="0" width="205" height="215" rx="10" fill="#091326" stroke="#38bdf8" stroke-width="2"/>
+    <rect x="14" y="14" width="177" height="28" rx="5" fill="#0369a1"/>
+    <text x="102" y="33" text-anchor="middle" fill="#e0f2fe" font-size="13" font-weight="700">3. 帧级滑动窗口</text>
+
+    <!-- Safe part -->
+    <rect x="14" y="56" width="177" height="44" rx="6" fill="#06281e" stroke="#10b981" stroke-width="1.2"/>
+    <text x="102" y="75" text-anchor="middle" fill="#4ade80" font-size="12" font-weight="700">✔ 安全前缀 [:cut]</text>
+    <text x="102" y="93" text-anchor="middle" fill="#a7f3d0" font-size="11.5">"号码：" ➔ 立即刷出</text>
+
+    <!-- Pending part -->
+    <rect x="14" y="110" width="177" height="50" rx="6" fill="#271c10" stroke="#f59e0b" stroke-width="1.2"/>
+    <text x="102" y="130" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="700">⏳ 疑似残片 [cut:]</text>
+    <text x="102" y="149" text-anchor="middle" fill="#fde68a" font-size="11.5">"{{EC_PI" 暂存 pending</text>
+
+    <!-- 3 Channels Tag -->
+    <rect x="14" y="172" width="177" height="28" rx="4" fill="#0f2942"/>
+    <text x="102" y="190" text-anchor="middle" fill="#7dd3fc" font-size="11">正文 / 思维链 / 工具 独立通道</text>
+  </g>
+
+  <!-- Arrow: Vault -> Step 3 (Lookup) -->
+  <path d="M 230 389 L 627 389 L 627 348" fill="none" stroke="#a855f7" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#arrow-dashed)"/>
+  <text x="430" y="380" text-anchor="middle" fill="#c084fc" font-size="12">第 2 帧到达闭合 "}}" ➔ 查询 Vault 替换</text>
+
+  <!-- Arrow: Step 3 -> Step 4 -->
+  <path d="M 730 207 L 767 207" stroke="#10b981" stroke-width="2.5" marker-end="url(#arrow-green)"/>
+
+  <!-- ================= STEP 4: 客户端无损接收 (Right) ================= -->
+  <g transform="translate(775, 125)">
+    <rect x="0" y="0" width="135" height="165" rx="10" fill="#091914" stroke="#10b981" stroke-width="2"/>
+    <rect x="12" y="14" width="111" height="28" rx="5" fill="#065f46"/>
+    <text x="67" y="33" text-anchor="middle" fill="#ecfdf5" font-size="13" font-weight="700">4. 还原输出</text>
+
+    <text x="67" y="70" text-anchor="middle" fill="#94a3b8" font-size="12">客户端最终收到</text>
+    <rect x="12" y="82" width="111" height="46" rx="5" fill="#064e3b" stroke="#10b981" stroke-width="1"/>
+    <text x="67" y="102" text-anchor="middle" fill="#6ee7b7" font-size="12" font-weight="700">号码：</text>
+    <text x="67" y="120" text-anchor="middle" fill="#ffffff" font-size="12" font-family="monospace">13800138000</text>
+
+    <text x="67" y="150" text-anchor="middle" fill="#34d399" font-size="11.5">0 隐私泄漏</text>
+  </g>
+</svg>

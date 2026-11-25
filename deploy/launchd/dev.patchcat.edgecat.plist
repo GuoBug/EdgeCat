@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EdgeCat macOS LaunchAgent (for Mac mini Homelab / MacBook Localhost Sidecar)
+
+  Install steps:
+    1. cp bin/edgecat /usr/local/bin/edgecat
+    2. mkdir -p ~/.config/edgecat ~/.local/share/edgecat
+    3. /usr/local/bin/edgecat init -out ~/.config/edgecat/edgecat.yaml
+       (adjust paths inside edgecat.yaml & replace YOUR_USERNAME below)
+    4. cp deploy/launchd/dev.patchcat.edgecat.plist ~/Library/LaunchAgents/
+    5. launchctl load -w ~/Library/LaunchAgents/dev.patchcat.edgecat.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.patchcat.edgecat</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/edgecat</string>
+        <string>serve</string>
+        <string>-config</string>
+        <string>/Users/YOUR_USERNAME/.config/edgecat/edgecat.yaml</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/.local/share/edgecat</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/.local/share/edgecat/edgecat.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.local/share/edgecat/edgecat.err.log</string>
+</dict>
+</plist>

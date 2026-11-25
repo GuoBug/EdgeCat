@@ -124,3 +124,63 @@ filter:
 		t.Fatal("expected validation error for invalid filter.policy")
 	}
 }
+
+func TestLoadConfig_ExtendedEnvFallbackAndUnresolvedGuard(t *testing.T) {
+	t.Setenv("EDGECAT_TEST_HMAC", "super-secret-hmac-key")
+	t.Setenv("EDGECAT_TEST_CLIENT_TOKEN", "ec-real-token-xyz")
+
+	cfgPath := filepath.Join(t.TempDir(), "edgecat-docker.yaml")
+	yamlBody := `
+server:
+  host: "0.0.0.0"
+auth:
+  enabled: true
+  clients:
+    - name: "nas-client"
+      token: "${EDGECAT_TEST_CLIENT_TOKEN}"
+local:
+  endpoint: "${EDGECAT_UNSET_LOCAL_URL:-http://host.docker.internal:11434/v1}"
+cloud:
+  api_key: "${EDGECAT_UNSET_CLOUD_KEY:-}"
+filter:
+  enabled: true
+  hmac_secret: "${EDGECAT_TEST_HMAC}"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlBody), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("expected valid docker config, got %v", err)
+	}
+	if cfg.Local.Endpoint != "http://host.docker.internal:11434/v1" {
+		t.Fatalf("expected fallback local endpoint, got %q", cfg.Local.Endpoint)
+	}
+	if cfg.Cloud.APIKey != "" {
+		t.Fatalf("expected empty fallback cloud api_key, got %q", cfg.Cloud.APIKey)
+	}
+	if cfg.Filter.HMACSecret != "super-secret-hmac-key" {
+		t.Fatalf("expected expanded hmac_secret, got %q", cfg.Filter.HMACSecret)
+	}
+	if cfg.Auth.Clients[0].Token != "ec-real-token-xyz" {
+		t.Fatalf("expected expanded client token, got %q", cfg.Auth.Clients[0].Token)
+	}
+
+	// Unresolved ${VAR} in auth token must fail-closed instead of authenticating literal "${VAR}"
+	badPath := filepath.Join(t.TempDir(), "edgecat-bad.yaml")
+	badYAML := `
+server:
+  host: "0.0.0.0"
+auth:
+  enabled: true
+  clients:
+    - name: "nas-client"
+      token: "${EDGECAT_MISSING_REQUIRED_TOKEN}"
+`
+	if err := os.WriteFile(badPath, []byte(badYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadConfig(badPath); err == nil {
+		t.Fatal("expected fail-closed error when auth client token has unresolved env var")
+	}
+}

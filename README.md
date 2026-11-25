@@ -99,25 +99,45 @@ In local-first and hybrid AI architectures, dispatching traffic directly to loca
 
 ## Quickstart
 
-### 1. Build
-EdgeCat supports CGO-free static compilation (`CGO_ENABLED=0`):
-```bash
-# Using Makefile
-make build
+### Option A: Single Static Binary (Workstation / Bare-Metal LAN)
 
+Download a prebuilt static binary (`windows` / `darwin` / `linux`, `amd64` & `arm64`) from [GitHub Releases](https://github.com/GuoBug/EdgeCat/releases), or build from source (`CGO_ENABLED=0`):
+```bash
+make build
 # Or direct Go build:
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/edgecat ./cmd/edgecat
 ```
 
-### 2. Run Test Suite
+Generate a starter configuration and run the built-in pre-flight check:
 ```bash
-make test
-# Or execute:
-go test -v ./...
+# 1. Generate config (default loopback mode; pass -lan for Homelab/NAS sharing with random strong tokens)
+./bin/edgecat init -out edgecat.yaml
+# ./bin/edgecat init -lan -out edgecat.yaml
+
+# 2. Pre-flight check (validates YAML invariants, SQLite write permissions, and live upstreams; add -offline to skip network)
+./bin/edgecat check -config edgecat.yaml
+
+# 3. Start the gateway (check build info via ./bin/edgecat version)
+./bin/edgecat -config edgecat.yaml
 ```
 
-### 3. Configuration & Startup
-Review `configs/edgecat.example.yaml`:
+### Option B: Docker Compose (Home NAS / Mac mini / Homelab)
+
+Built `FROM scratch` (zero shell, non-root `65532:65532`, bundled CA certs & `tzdata`, with `/edgecat ping` healthcheck):
+```bash
+# 1. Copy environment template and set a strong EDGECAT_CLIENT_TOKEN (plus optional cloud fallback key)
+cp .env.example .env
+
+# 2. Build and start in background (reaches host Ollama via host.docker.internal; persists SQLite in named volume)
+docker compose up -d
+```
+
+### Option C: Background Daemon Templates
+- **Linux (`systemd`)**: [`deploy/systemd/edgecat.service`](deploy/systemd/edgecat.service) (includes `ExecStartPre` validation and filesystem sandboxing).
+- **macOS (`launchd`)**: [`deploy/launchd/dev.patchcat.edgecat.plist`](deploy/launchd/dev.patchcat.edgecat.plist) (for Mac mini homelab servers or MacBook sidecars).
+
+### Example Configuration (`configs/edgecat.example.yaml`)
+Supports `${ENV_VAR}` and `${ENV_VAR:-default}` expansion (unresolved variables in enabled auth tokens fail closed at startup):
 ```yaml
 server:
   host: "127.0.0.1"
@@ -140,8 +160,8 @@ local:
     "gpt-4o-mini": "qwen2.5:7b"
 
 cloud:
-  endpoint: "https://api.openai.com/v1"
-  api_key: "sk-your-cloud-api-key"
+  endpoint: "${EDGECAT_CLOUD_ENDPOINT:-https://api.openai.com/v1}"
+  api_key: "${EDGECAT_CLOUD_API_KEY:-}"
   timeout_ms: 60000
   model_mapping:
     "default": "gpt-4o-mini"
@@ -162,11 +182,6 @@ audit:
   sqlite_path: "data/edgecat_audit.db"
   batch_size: 50
   flush_interval_ms: 1000
-```
-
-Start the gateway:
-```bash
-./bin/edgecat -config configs/edgecat.example.yaml
 ```
 
 ---

@@ -1,0 +1,11 @@
+.git
+.github
+bin/
+dist/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.exe
+*.test
+*.out
+docs/assets/

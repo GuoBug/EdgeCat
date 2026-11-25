@@ -1,0 +1,77 @@
+# EdgeCat - Docker & Home NAS Configuration Template
+# Copyright (c) 2026 Guo Qiang. Distributed under Apache-2.0.
+#
+# Security Note:
+# Because containers bind to 0.0.0.0, Fail-Closed LAN Guard (R2.1) requires
+# auth.enabled: true and a non-empty EDGECAT_CLIENT_TOKEN environment variable.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_ms: 30000
+  write_timeout_ms: 120000
+  stream_idle_timeout_ms: 300000
+  allowed_origins:
+    - "https://patchcat.dev"
+    - "http://localhost:5173"
+  max_request_body_bytes: 10485760
+  allow_insecure_lan: false
+
+auth:
+  enabled: true
+  clients:
+    - name: "homelab-primary"
+      token: "${EDGECAT_CLIENT_TOKEN}"
+      daily_cloud_limit: 500
+
+local:
+  endpoint: "${EDGECAT_LOCAL_ENDPOINT:-http://host.docker.internal:11434/v1}"
+  api_key: "${EDGECAT_LOCAL_API_KEY:-}"
+  max_concurrent_local: 2
+  queue_wait_ms: 0
+  ttft_timeout_ms: 3500
+  stream_idle_timeout_ms: 30000
+  breaker_failure_threshold: 3
+  breaker_cooldown_ms: 30000
+  model_mapping:
+    "default": "qwen2.5:7b"
+    "gpt-4o-mini": "qwen2.5:7b"
+    "qwen2.5:7b": "qwen2.5:7b"
+
+cloud:
+  endpoint: "${EDGECAT_CLOUD_ENDPOINT:-https://api.openai.com/v1}"
+  api_key: "${EDGECAT_CLOUD_API_KEY:-}"
+  timeout_ms: 60000
+  model_mapping:
+    "default": "gpt-4o-mini"
+    "qwen2.5:7b": "gpt-4o-mini"
+
+filter:
+  enabled: true
+  policy: "mask_always"
+  mask_phone: true
+  mask_email: true
+  mask_ipv4: true
+  mask_apikey: true
+  mask_idcard: false
+  mask_bankcard: false
+  block_apikey_tool_rehydrate: true
+
+contract:
+  strict_json_enabled: true
+  max_repair_attempts: 1
+  repair_timeout_ms: 5000
+
+audit:
+  sqlite_path: "/var/lib/edgecat/edgecat_audit.db"
+  batch_size: 50
+  flush_interval_ms: 1000
+  queue_size: 10000
+
+memory:
+  enabled: false
+  sqlite_path: "/var/lib/edgecat/edgecat_memory.db"
+  max_facts: 5
+  max_short_term: 3
+  query_timeout_ms: 50
+  reader_max_open_conns: 4
