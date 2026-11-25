@@ -25,6 +25,7 @@ package memory
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -236,6 +237,18 @@ func NewPlugin(opts Options) (*Plugin, error) {
 	if len(opts.HMACSecret) > 0 {
 		secretCopy = make([]byte, len(opts.HMACSecret))
 		copy(secretCopy, opts.HMACSecret)
+	} else {
+		// Derive and persist a per-database random 32-byte salt when filter.hmac_secret
+		// is not configured. This prevents stored placeholders from using sequential _1/_2
+		// indices that would collide with per-request sequential Vaults during Rehydrate,
+		// while preserving deterministic AddFact deduplication across restarts.
+		salt, err := loadOrCreateLocalSalt(writerDB)
+		if err != nil {
+			_ = readerDB.Close()
+			_ = writerDB.Close()
+			return nil, fmt.Errorf("init memory local pii salt: %w", err)
+		}
+		secretCopy = salt
 	}
 
 	p := &Plugin{
@@ -313,6 +326,11 @@ func initMemorySchema(db *sql.DB) error {
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_memory_short_term_client_exp ON memory_short_term(client_name, expires_at);
+
+	CREATE TABLE IF NOT EXISTS memory_meta (
+		key TEXT PRIMARY KEY,
+		value BLOB NOT NULL
+	);
 	`
 	if _, err := db.Exec(baseSchema); err != nil {
 		return err
@@ -398,13 +416,37 @@ func migrateMemoryFactsColumns(db *sql.DB) error {
 
 	if _, err := db.Exec(`
 		UPDATE memory_facts
-		SET created_at_unix = COALESCE(CAST(strftime('%s', created_at) AS INTEGER), 0)
+		SET created_at_unix = COALESCE(
+			CAST(strftime('%s', created_at) AS INTEGER),
+			CAST(strftime('%s', 'now') AS INTEGER)
+		)
 		WHERE created_at_unix IS NULL
 	`); err != nil {
 		return fmt.Errorf("backfill memory_facts.created_at_unix: %w", err)
 	}
 
 	return nil
+}
+
+func loadOrCreateLocalSalt(db *sql.DB) ([]byte, error) {
+	const metaKey = "local_pii_salt"
+	var existing []byte
+	err := db.QueryRow(`SELECT value FROM memory_meta WHERE key = ?`, metaKey).Scan(&existing)
+	if err == nil && len(existing) >= 16 {
+		return existing, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?, ?)`, metaKey, salt); err != nil {
+		return nil, err
+	}
+	return salt, nil
 }
 
 // Close drains queued hit counter updates and releases both Reader and Writer SQLite pools.
@@ -449,7 +491,7 @@ func (p *Plugin) Name() string {
 //     inserted as "[EdgeCat Dynamic Context]" immediately before the last user
 //     message (or prepended after Zone 1 if PrependDynamicContext is enabled).
 func (p *Plugin) MutatePreMask(ctx context.Context, req *proxy.Request, meta *proxy.RequestMeta) error {
-	if req == nil || meta == nil || p.closed.Load() {
+	if p == nil || req == nil || meta == nil || p.closed.Load() {
 		return nil
 	}
 
@@ -461,7 +503,9 @@ func (p *Plugin) MutatePreMask(ctx context.Context, req *proxy.Request, meta *pr
 
 	pinnedFacts, err := p.ListPinnedFacts(qCtx, clientName, p.maxPinnedFacts)
 	if err != nil {
-		log.Printf("[Memory] Pinned fact lookup skipped for client=%q: %v", clientName, err)
+		if !p.closed.Load() {
+			log.Printf("[Memory] Pinned fact lookup skipped for client=%q: %v", clientName, err)
+		}
 		pinnedFacts = nil
 	}
 
@@ -469,14 +513,18 @@ func (p *Plugin) MutatePreMask(ctx context.Context, req *proxy.Request, meta *pr
 	if query != "" {
 		facts, err = p.SearchFacts(qCtx, clientName, query, p.maxFacts)
 		if err != nil {
-			log.Printf("[Memory] Fact lookup skipped for client=%q: %v", clientName, err)
+			if !p.closed.Load() {
+				log.Printf("[Memory] Fact lookup skipped for client=%q: %v", clientName, err)
+			}
 			facts = nil
 		}
 	}
 
 	shortTerm, err := p.ListShortTerm(qCtx, clientName, p.maxShortTerm)
 	if err != nil {
-		log.Printf("[Memory] Short-term lookup skipped for client=%q: %v", clientName, err)
+		if !p.closed.Load() {
+			log.Printf("[Memory] Short-term lookup skipped for client=%q: %v", clientName, err)
+		}
 		shortTerm = nil
 	}
 
@@ -704,15 +752,19 @@ func (p *Plugin) supersedeFactInternal(ctx context.Context, clientName string, o
 	defer func() { _ = tx.Rollback() }()
 
 	var (
+		oldFact      string
 		validTo      sql.NullInt64
 		supersededBy sql.NullInt64
 		oldPinned    int
+		oldDormant   string
+		oldTags      string
+		oldQuote     string
 	)
 	err = tx.QueryRowContext(ctx, `
-		SELECT valid_to, superseded_by, pinned
+		SELECT fact, valid_to, superseded_by, pinned, dormant_reason, tags, source_quote
 		FROM memory_facts
 		WHERE id = ? AND client_name = ?
-	`, oldID, clientName).Scan(&validTo, &supersededBy, &oldPinned)
+	`, oldID, clientName).Scan(&oldFact, &validTo, &supersededBy, &oldPinned, &oldDormant, &oldTags, &oldQuote)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("%w: id=%d client=%s", ErrFactNotFound, oldID, clientName)
 	}
@@ -730,23 +782,94 @@ func (p *Plugin) supersedeFactInternal(ctx context.Context, clientName string, o
 		pinnedInt = 1
 	}
 
-	insRes, err := tx.ExecContext(ctx, `
-		INSERT INTO memory_facts (client_name, fact, tags, pinned, source_quote, created_at_unix)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, clientName, cleanFact, cleanTags, pinnedInt, cleanQuote, nowUnix)
-	if err != nil {
-		return 0, err
+	// Self-equivalent supersede: avoid creating a redundant hop when sanitized text is identical.
+	if cleanFact == oldFact {
+		newTags := oldTags
+		if cleanTags != "" {
+			newTags = cleanTags
+		}
+		newQuote := oldQuote
+		if cleanQuote != "" {
+			newQuote = cleanQuote
+		}
+		if pinnedInt != oldPinned || oldDormant != "" || newTags != oldTags || newQuote != oldQuote {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE memory_facts
+				SET pinned = ?, dormant_reason = '', tags = ?, source_quote = ?, updated_at = CURRENT_TIMESTAMP
+				WHERE id = ? AND client_name = ?
+			`, pinnedInt, newTags, newQuote, oldID, clientName); err != nil {
+				return 0, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, err
+		}
+		return oldID, nil
 	}
-	newID, err := insRes.LastInsertId()
-	if err != nil {
-		return 0, err
+
+	// Canonical active fact merge: if another active row under clientName already carries
+	// identical sanitized text, converge oldID.superseded_by onto that terminal row instead
+	// of inserting a duplicate active row. Because existingID has superseded_by IS NULL,
+	// pointing oldID -> existingID is guaranteed cycle-free.
+	var (
+		targetID     int64
+		existPinned  int
+		existDormant string
+		existTags    string
+		existQuote   string
+	)
+	dupErr := tx.QueryRowContext(ctx, `
+		SELECT id, pinned, dormant_reason, tags, source_quote
+		FROM memory_facts
+		WHERE client_name = ? AND fact = ? AND id != ? AND valid_to IS NULL AND superseded_by IS NULL
+		ORDER BY id DESC
+		LIMIT 1
+	`, clientName, cleanFact, oldID).Scan(&targetID, &existPinned, &existDormant, &existTags, &existQuote)
+	if dupErr != nil && !errors.Is(dupErr, sql.ErrNoRows) {
+		return 0, dupErr
+	}
+
+	if dupErr == nil {
+		mergedPinned := existPinned
+		if pinnedInt == 1 {
+			mergedPinned = 1
+		}
+		mergedTags := existTags
+		if cleanTags != "" && existTags == "" {
+			mergedTags = cleanTags
+		}
+		mergedQuote := existQuote
+		if cleanQuote != "" && cleanQuote != existQuote {
+			mergedQuote = cleanQuote
+		}
+		if mergedPinned != existPinned || existDormant != "" || mergedTags != existTags || mergedQuote != existQuote {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE memory_facts
+				SET pinned = ?, dormant_reason = '', tags = ?, source_quote = ?, updated_at = CURRENT_TIMESTAMP
+				WHERE id = ? AND client_name = ?
+			`, mergedPinned, mergedTags, mergedQuote, targetID, clientName); err != nil {
+				return 0, err
+			}
+		}
+	} else {
+		insRes, err := tx.ExecContext(ctx, `
+			INSERT INTO memory_facts (client_name, fact, tags, pinned, source_quote, created_at_unix)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, clientName, cleanFact, cleanTags, pinnedInt, cleanQuote, nowUnix)
+		if err != nil {
+			return 0, err
+		}
+		targetID, err = insRes.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	updRes, err := tx.ExecContext(ctx, `
 		UPDATE memory_facts
 		SET valid_to = ?, superseded_by = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE id = ? AND client_name = ? AND valid_to IS NULL AND superseded_by IS NULL
-	`, nowUnix, newID, oldID, clientName)
+	`, nowUnix, targetID, oldID, clientName)
 	if err != nil {
 		return 0, err
 	}
@@ -761,7 +884,7 @@ func (p *Plugin) supersedeFactInternal(ctx context.Context, clientName string, o
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return newID, nil
+	return targetID, nil
 }
 
 // GetFact retrieves a single fact strictly scoped to clientName via the read-only pool.
@@ -900,9 +1023,10 @@ func (p *Plugin) SweepDormantUnused(ctx context.Context, maxIdle time.Duration) 
 	return total, nil
 }
 
-// MarkQuoteMissing marks an unpinned (pinned=0) fact belonging to clientName with
-// dormant_reason='quote_missing'. Returns ErrFactNotFound if factID does not belong
-// to clientName; pinned=1 facts belonging to clientName remain untouched (no-op).
+// MarkQuoteMissing marks an unpinned (pinned=0), currently active fact belonging to
+// clientName with dormant_reason='quote_missing'. Returns ErrFactNotFound if factID does
+// not belong to clientName, ErrFactConflict if already superseded/invalidated, and acts
+// as a safe no-op on pinned=1 facts.
 func (p *Plugin) MarkQuoteMissing(ctx context.Context, clientName string, factID int64) error {
 	clientName = normalizeClient(clientName)
 	if factID <= 0 {
@@ -915,15 +1039,22 @@ func (p *Plugin) MarkQuoteMissing(ctx context.Context, clientName string, factID
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var pinned int
+	var (
+		pinned       int
+		validTo      sql.NullInt64
+		supersededBy sql.NullInt64
+	)
 	err = tx.QueryRowContext(ctx, `
-		SELECT pinned FROM memory_facts WHERE id = ? AND client_name = ?
-	`, factID, clientName).Scan(&pinned)
+		SELECT pinned, valid_to, superseded_by FROM memory_facts WHERE id = ? AND client_name = ?
+	`, factID, clientName).Scan(&pinned, &validTo, &supersededBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: id=%d client=%s", ErrFactNotFound, factID, clientName)
 	}
 	if err != nil {
 		return err
+	}
+	if validTo.Valid || supersededBy.Valid {
+		return fmt.Errorf("%w: id=%d", ErrFactConflict, factID)
 	}
 	if pinned != 0 {
 		return nil
@@ -932,37 +1063,53 @@ func (p *Plugin) MarkQuoteMissing(ctx context.Context, clientName string, factID
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE memory_facts
 		SET dormant_reason = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ? AND client_name = ? AND pinned = 0
+		WHERE id = ? AND client_name = ? AND pinned = 0 AND valid_to IS NULL AND superseded_by IS NULL
 	`, DormantReasonQuoteMissing, factID, clientName); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// WakeFact clears dormant_reason='' and refreshes last_served_at for a fact belonging
-// to clientName. Returns ErrFactNotFound if factID does not exist under clientName.
+// WakeFact clears dormant_reason='' and refreshes last_served_at for a non-superseded fact
+// belonging to clientName. Returns ErrFactNotFound if factID does not exist under clientName,
+// and ErrFactConflict if factID has already been superseded or invalidated.
 func (p *Plugin) WakeFact(ctx context.Context, clientName string, factID int64) error {
 	clientName = normalizeClient(clientName)
 	if factID <= 0 {
 		return fmt.Errorf("%w: invalid id %d", ErrFactNotFound, factID)
 	}
 
-	res, err := p.writerDB.ExecContext(ctx, `
-		UPDATE memory_facts
-		SET dormant_reason = '', last_served_at = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE id = ? AND client_name = ?
-	`, time.Now().Unix(), factID, clientName)
+	tx, err := p.writerDB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		validTo      sql.NullInt64
+		supersededBy sql.NullInt64
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT valid_to, superseded_by FROM memory_facts WHERE id = ? AND client_name = ?
+	`, factID, clientName).Scan(&validTo, &supersededBy)
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: id=%d client=%s", ErrFactNotFound, factID, clientName)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if validTo.Valid || supersededBy.Valid {
+		return fmt.Errorf("%w: id=%d", ErrFactConflict, factID)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE memory_facts
+		SET dormant_reason = '', last_served_at = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND client_name = ? AND valid_to IS NULL AND superseded_by IS NULL
+	`, time.Now().Unix(), factID, clientName); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SearchFacts queries the read-only Reader pool using FTS5 trigram matching
@@ -1016,25 +1163,40 @@ func (p *Plugin) SearchFacts(ctx context.Context, clientName, query string, limi
 		}
 	}
 
-	// Fallback for short queries (< 3 runes) where SQLite trigram cannot index tokens.
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || utf8.RuneCountInString(trimmed) >= 3 {
+	// Fallback when no >=3-rune trigram token exists (e.g., "Go", "PG?", or "Go 语言").
+	if ftsExpr != "" {
 		return nil, nil
 	}
-	pattern := "%" + trimmed + "%"
-	rows, err := p.readerDB.QueryContext(ctx, `
+	shortTerms := extractShortFallbackTerms(query)
+	if len(shortTerms) == 0 {
+		return nil, nil
+	}
+
+	clauses := make([]string, 0, len(shortTerms))
+	args := make([]any, 0, 2+len(shortTerms)*2)
+	args = append(args, clientName)
+	for _, tok := range shortTerms {
+		pattern := "%" + escapeLikeTerm(tok) + "%"
+		clauses = append(clauses, `(fact LIKE ? ESCAPE '\' OR tags LIKE ? ESCAPE '\')`)
+		args = append(args, pattern, pattern)
+	}
+	args = append(args, candidateLimit)
+
+	likeSQL := fmt.Sprintf(`
 		SELECT id, client_name, fact, tags, pinned, valid_to, superseded_by,
 		       dormant_reason, source_quote, last_served_at, served_count, created_at
 		FROM memory_facts
 		WHERE client_name = ?
-		  AND (fact LIKE ? OR tags LIKE ?)
+		  AND (%s)
 		  AND (
 		      (valid_to IS NULL AND superseded_by IS NULL AND dormant_reason = '' AND pinned = 0)
 		      OR superseded_by IS NOT NULL
 		  )
 		ORDER BY id DESC
 		LIMIT ?
-	`, clientName, pattern, pattern, candidateLimit)
+	`, strings.Join(clauses, " OR "))
+
+	rows, err := p.readerDB.QueryContext(ctx, likeSQL, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1051,8 +1213,21 @@ func (p *Plugin) resolveFactLineage(ctx context.Context, clientName string, cand
 		return nil, nil
 	}
 
-	seen := make(map[int64]struct{}, limit)
+	seenID := make(map[int64]struct{}, limit)
+	seenFact := make(map[string]struct{}, limit)
 	results := make([]Fact, 0, limit)
+
+	addUnique := func(f Fact) {
+		if _, dupID := seenID[f.ID]; dupID {
+			return
+		}
+		if _, dupText := seenFact[f.Fact]; dupText {
+			return
+		}
+		seenID[f.ID] = struct{}{}
+		seenFact[f.Fact] = struct{}{}
+		results = append(results, f)
+	}
 
 	for _, cand := range candidates {
 		if len(results) >= limit {
@@ -1061,10 +1236,7 @@ func (p *Plugin) resolveFactLineage(ctx context.Context, clientName string, cand
 
 		if cand.SupersededBy == nil {
 			if cand.ValidTo == nil && cand.DormantReason == "" && !cand.Pinned {
-				if _, dup := seen[cand.ID]; !dup {
-					seen[cand.ID] = struct{}{}
-					results = append(results, cand)
-				}
+				addUnique(cand)
 			}
 			continue
 		}
@@ -1089,10 +1261,7 @@ func (p *Plugin) resolveFactLineage(ctx context.Context, clientName string, cand
 
 			if nextFact.SupersededBy == nil {
 				if nextFact.ValidTo == nil && nextFact.DormantReason == "" && !nextFact.Pinned {
-					if _, dup := seen[nextFact.ID]; !dup {
-						seen[nextFact.ID] = struct{}{}
-						results = append(results, nextFact)
-					}
+					addUnique(nextFact)
 				}
 				break
 			}
@@ -1233,13 +1402,16 @@ func (p *Plugin) hitWorker() {
 }
 
 func (p *Plugin) flushHitDeltas(deltas map[hitKey]hitDelta) (int64, error) {
-	tx, err := p.writerDB.Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tx, err := p.writerDB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		UPDATE memory_facts
 		SET served_count = served_count + ?,
 		    last_served_at = CASE
@@ -1255,7 +1427,7 @@ func (p *Plugin) flushHitDeltas(deltas map[hitKey]hitDelta) (int64, error) {
 
 	var totalHits int64
 	for k, d := range deltas {
-		if _, err := stmt.Exec(d.count, d.lastServed, d.lastServed, k.factID, k.clientName); err != nil {
+		if _, err := stmt.ExecContext(ctx, d.count, d.lastServed, d.lastServed, k.factID, k.clientName); err != nil {
 			return 0, err
 		}
 		totalHits += d.count
@@ -1455,4 +1627,35 @@ func containsCJK(runes []rune) bool {
 		}
 	}
 	return false
+}
+
+// extractShortFallbackTerms extracts up to 4 unique short (< 3-rune) alphanumeric/CJK
+// tokens when a query contains no >= 3-rune trigram terms (e.g., "PG?" or "Go 语言").
+func extractShortFallbackTerms(raw string) []string {
+	const maxShortTerms = 4
+	runs := strings.FieldsFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
+	})
+	seen := make(map[string]struct{}, maxShortTerms)
+	out := make([]string, 0, maxShortTerms)
+	for _, run := range runs {
+		n := utf8.RuneCountInString(run)
+		if n == 0 || n >= 3 {
+			continue
+		}
+		if _, dup := seen[run]; dup {
+			continue
+		}
+		seen[run] = struct{}{}
+		out = append(out, run)
+		if len(out) >= maxShortTerms {
+			break
+		}
+	}
+	return out
+}
+
+func escapeLikeTerm(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }

@@ -62,7 +62,7 @@ SQLite 默认的 `unicode61` 分词器无法切分无空格的连续中文句子
 
 ### 2.6 强制命名空间隔离与零明文 PII 落盘
 - 所有查询、替代、休眠、唤醒与命中统计 SQL 均强制绑定 `WHERE client_name = ?`，防止跨客户端越权读取或篡改。
-- 所有持久化文本字段（`fact`、`tags`、`source_quote` 及短期 `summary`）入库前一律经过 `sanitizeForStorage`（`filter.Masker` 及可选 `HMAC-SHA256` 稳定占位符 `{{EC_PII_<TYPE>_<16hex>}}`）脱敏。
+- 所有持久化文本字段（`fact`、`tags`、`source_quote` 及短期 `summary`）入库前一律经过 `sanitizeForStorage`（`filter.Masker` 配合 `HMAC-SHA256` 稳定占位符 `{{EC_PII_<TYPE>_<16hex>}}`）脱敏。当未显式配置 `filter.hmac_secret` 时，插件会在本地 `memory_meta` 表自动生成并持久化 32 字节随机盐值，确保存储层始终产出 16 位十六进制摘要占位符，杜绝与单次请求级顺序占位符（`{{EC_PII_<TYPE>_1}}`）在响应还原时发生窜号碰撞。
 
 ---
 

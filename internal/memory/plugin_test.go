@@ -697,3 +697,159 @@ func TestLayeredMemory_Dormancy_QuoteGuard_And_ConcurrentAsyncHitTracking(t *tes
 	_ = tinyPlugin.Close()
 	raceWG.Wait()
 }
+
+func TestLayeredMemory_AuditFixes_NoHMACCollision_SupersedeMerge_ClosedStateMachine_ShortQueries(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. P1 Fix: When filter.hmac_secret is empty (default), stored PII placeholders must NEVER
+	// use sequential _1 indices that collide with per-request Vault rehydration.
+	t.Run("NoSequentialPlaceholderCollisionWithoutHMACSecret", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		dbPath := filepath.Join(tmpDir, "no_hmac.db")
+		masker := filter.NewMasker(true, true, true, true)
+
+		var upstreamBody []byte
+		cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamBody, _ = io.ReadAll(r.Body)
+			// Upstream echoes back the entire system+user messages so we can verify Rehydrate does not cross-corrupt!
+			var parsed map[string]any
+			_ = json.Unmarshal(upstreamBody, &parsed)
+			msgs, _ := parsed["messages"].([]any)
+			sysContent := msgs[0].(map[string]any)["content"].(string)
+			userContent := msgs[1].(map[string]any)["content"].(string)
+			reply := fmt.Sprintf("MEM=[%s] USER=[%s]", sysContent, userContent)
+			respObj := map[string]any{
+				"id": "chatcmpl-p1",
+				"choices": []any{
+					map[string]any{
+						"index":   0,
+						"message": map[string]any{"role": "assistant", "content": reply},
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(respObj)
+		}))
+		defer cloud.Close()
+
+		memPlugin, err := memory.NewPlugin(memory.Options{
+			SQLitePath:     dbPath,
+			QueryTimeoutMs: 500,
+			Masker:         masker,
+			HMACSecret:     nil, // Default empty HMACSecret!
+		})
+		if err != nil {
+			t.Fatalf("NewPlugin: %v", err)
+		}
+
+		const adminPhone = "13800138000"
+		const callerPhone = "13912345678"
+		id1, err := memPlugin.AddFact(ctx, "anonymous", "值班管理员联系电话是 "+adminPhone, "ops")
+		if err != nil {
+			t.Fatalf("AddFact: %v", err)
+		}
+
+		// Close and reopen against the same DB to verify local salt persistence & dedup across restarts!
+		_ = memPlugin.Close()
+		memPlugin, err = memory.NewPlugin(memory.Options{
+			SQLitePath:     dbPath,
+			QueryTimeoutMs: 500,
+			Masker:         masker,
+			HMACSecret:     nil,
+		})
+		if err != nil {
+			t.Fatalf("Reopen NewPlugin: %v", err)
+		}
+		defer func() { _ = memPlugin.Close() }()
+
+		idAfterRestart, err := memPlugin.AddFact(ctx, "anonymous", "值班管理员联系电话是 "+adminPhone, "ops")
+		if err != nil || idAfterRestart != id1 {
+			t.Fatalf("expected persistent local salt to preserve idempotent ID %d across restart, got %d (err=%v)", id1, idAfterRestart, err)
+		}
+
+		cfg := config.DefaultConfig()
+		cfg.Local.Endpoint = ""
+		cfg.Cloud.Endpoint = cloud.URL
+		cfg.Filter.Enabled = true
+		cfg.Filter.HMACSecret = "" // Default empty!
+
+		auditLogger, _ := audit.NewLogger(filepath.Join(tmpDir, "audit.db"), 10, 100, 100)
+		t.Cleanup(func() { _ = auditLogger.Close() })
+		qm, _ := quota.NewManager(auditLogger.DB(), cfg.Auth.Clients)
+		h := proxy.NewHandler(cfg, masker, router.NewRouter(cfg), contract.NewGuard(false, 1, 5000), auditLogger, qm, proxy.WithRequestMutators(memPlugin))
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(fmt.Sprintf(`{
+			"model": "default",
+			"messages": [{"role": "user", "content": "我的手机号是 %s，请问值班管理员联系电话是多少？"}],
+			"stream": false
+		}`, callerPhone))))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		bodyStr := rec.Body.String()
+		// Caller's phone must rehydrate to callerPhone, while stored memory placeholder must NOT become callerPhone!
+		if !strings.Contains(bodyStr, "USER=[我的手机号是 "+callerPhone) {
+			t.Fatalf("expected caller phone rehydrated in user echo, got: %s", bodyStr)
+		}
+		if strings.Contains(bodyStr, "管理员联系电话是 "+callerPhone) {
+			t.Fatalf("P1 collision! Stored admin phone placeholder was overwritten by caller phone: %s", bodyStr)
+		}
+		if strings.Contains(string(upstreamBody), "{{EC_PII_PHONE_1}}") && strings.Count(string(upstreamBody), "{{EC_PII_PHONE_1}}") > 1 {
+			t.Fatalf("duplicate sequential placeholder {{EC_PII_PHONE_1}} in upstream payload: %s", upstreamBody)
+		}
+	})
+
+	// 2. P2 Fixes: SupersedeFact self-noop & active merge, closed WakeFact/MarkQuoteMissing, and short queries ("PG?", "Go 语言").
+	t.Run("SupersedeCanonicalMerge_ClosedDormancyState_And_ShortTokenFallback", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "p2_fixes.db")
+		plugin, err := memory.NewPlugin(memory.Options{SQLitePath: dbPath, QueryTimeoutMs: 500})
+		if err != nil {
+			t.Fatalf("NewPlugin: %v", err)
+		}
+		defer func() { _ = plugin.Close() }()
+
+		// Self-supersede with identical text returns same ID without wasting a hop.
+		idA, _ := plugin.AddFact(ctx, "alice", "存储后端使用 PG 14", "db")
+		sameID, err := plugin.SupersedeFact(ctx, "alice", idA, "  存储后端使用 PG 14  ", "db")
+		if err != nil || sameID != idA {
+			t.Fatalf("expected self-supersede to return %d, got %d (err=%v)", idA, sameID, err)
+		}
+
+		// Canonical active merge: idB already holds target text; superseding idA -> text(idB) converges onto idB!
+		idB, _ := plugin.AddFact(ctx, "alice", "存储后端统一使用 Go 语言内置 SQLite", "db")
+		mergedID, err := plugin.SupersedeFact(ctx, "alice", idA, "存储后端统一使用 Go 语言内置 SQLite", "db")
+		if err != nil || mergedID != idB {
+			t.Fatalf("expected canonical merge onto existing ID %d, got %d (err=%v)", idB, mergedID, err)
+		}
+
+		// Searching must return idB exactly once (zero duplicate bullet lines!).
+		hits, err := plugin.SearchFacts(ctx, "alice", "存储后端", 5)
+		if err != nil || len(hits) != 1 || hits[0].ID != idB {
+			t.Fatalf("expected single deduplicated hit %d, got %+v (err=%v)", idB, hits, err)
+		}
+
+		// Superseded historical row idA must reject WakeFact and MarkQuoteMissing with ErrFactConflict.
+		if err := plugin.WakeFact(ctx, "alice", idA); !errors.Is(err, memory.ErrFactConflict) {
+			t.Fatalf("expected ErrFactConflict when waking superseded fact, got %v", err)
+		}
+		if err := plugin.MarkQuoteMissing(ctx, "alice", idA); !errors.Is(err, memory.ErrFactConflict) {
+			t.Fatalf("expected ErrFactConflict when marking superseded fact quote_missing, got %v", err)
+		}
+
+		// Punctuation-padded short query ("PG?") chases idA -> idB via short-token LIKE fallback!
+		pgHits, err := plugin.SearchFacts(ctx, "alice", "PG?", 5)
+		if err != nil || len(pgHits) != 1 || pgHits[0].ID != idB {
+			t.Fatalf("expected short query 'PG?' to match idA and chase to idB (%d), got %+v (err=%v)", idB, pgHits, err)
+		}
+
+		// Multi-word 2-rune query ("Go 语言", total 5 runes >= 3, each token 2 runes < 3) matches idB!
+		goHits, err := plugin.SearchFacts(ctx, "alice", "Go 语言", 5)
+		if err != nil || len(goHits) != 1 || goHits[0].ID != idB {
+			t.Fatalf("expected multi-short-token query 'Go 语言' to match idB (%d), got %+v (err=%v)", idB, goHits, err)
+		}
+	})
+}

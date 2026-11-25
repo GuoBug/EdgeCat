@@ -63,7 +63,7 @@ Prepending query-dependent retrieval results at `messages[0]` mutates the leadin
 
 ### 2.6 Mandatory Namespace Isolation & Zero-Plaintext-PII Persistence
 - Every read, write, supersede, dormancy, and wake SQL statement binds `WHERE client_name = ?`.
-- All persisted text fields (`fact`, `tags`, `source_quote`, and short-term `summary`) pass through `sanitizeForStorage` (`filter.Masker` + optional `filter.NewStableVault` HMAC-SHA256 `{{EC_PII_<TYPE>_<16hex>}}` placeholders) before touching SQLite.
+- All persisted text fields (`fact`, `tags`, `source_quote`, and short-term `summary`) pass through `sanitizeForStorage` (`filter.Masker` + `filter.NewStableVault` HMAC-SHA256 `{{EC_PII_<TYPE>_<16hex>}}` placeholders) before touching SQLite. When `filter.hmac_secret` is omitted, `memory.Plugin` generates and persists a random 32-byte per-database salt in `memory_meta` so stored placeholders still use 16-hex digests and never collide with request-scoped sequential `{{EC_PII_<TYPE>_1}}` counters during response rehydration.
 
 ---
 
