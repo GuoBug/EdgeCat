@@ -1070,7 +1070,7 @@ func (p *Plugin) MarkQuoteMissing(ctx context.Context, clientName string, factID
 	return tx.Commit()
 }
 
-// WakeFact clears dormant_reason='' and refreshes last_served_at for a non-superseded fact
+// WakeFact clears dormant_reason=” and refreshes last_served_at for a non-superseded fact
 // belonging to clientName. Returns ErrFactNotFound if factID does not exist under clientName,
 // and ErrFactConflict if factID has already been superseded or invalidated.
 func (p *Plugin) WakeFact(ctx context.Context, clientName string, factID int64) error {

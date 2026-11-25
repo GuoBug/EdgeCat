@@ -43,6 +43,10 @@ go test -v ./...
   ```bash
   go test -v ./internal/filter
   ```
+- **测试可选分层记忆、双区 Prefix-Cache 与时序替代链（`R3.2` / `R3.2.1`）**：
+  ```bash
+  go test -v ./internal/memory
+  ```
 - **静态代码合规检查**：
   ```bash
   gofmt -l .

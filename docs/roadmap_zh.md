@@ -57,6 +57,7 @@
 | :--- | :--- | :--- | :---: |
 | **R3.1** | **双阶段扩展接口 (`RequestMutator`)** | 在 `internal/proxy/mutator.go` 中提炼双阶段入站请求变异器接口（`StagePreMask` 脱敏前注入与策略校验 + `StagePostMask` 脱敏后/路由前观测与路由收紧），支持 `WithRequestMutators` / `UseMutator` 零侵入挂载、`*MutatorError` 自定义拦截响应及 `/admin/status` 可观测暴露。 | ✅ 已完成 |
 | **R3.2** | **可选的分层记忆插件示例 (Opt-in Memory Plugin)** | 已在 `internal/memory/plugin.go` 落地为默认关闭的 `RequestMutator` 示例插件：<br>1. **读写双句柄**：分离 SQLite Writer（`MaxOpenConns(1)`）与只读 Reader（`query_only(ON)`）连接池，防止热路径读取被写入阻塞。<br>2. **中文 FTS5 支持**：显式使用 `tokenize='trigram'`（搭配短词 `LIKE` 回退与语法安全转义）。<br>3. **分层存储与稳定键**：支持长期脱敏事实（`memory_facts`）与带 TTL 的短期摘要（`memory_short_term`）；入库前自动脱敏，支持 `HMAC-SHA256(原文, 本地密钥)` 前 8 字节稳定键（`filter.NewStableVault`），并强制按 `client_name` 隔离命名空间。 | ✅ 已完成 |
+| **R3.2.1** | **受治理记忆生命周期与双区 Prefix-Cache 注入** | 在 `internal/memory` 与 `internal/proxy/protocol.go` 完成演进升级：<br>1. **双区注入护缓存**：`pinned=1` 常驻规则按 `id ASC` 确定性置于 `messages[0]`，动态检索与短期摘要通过 `InsertSystemBeforeLastUser` 插在最后一条 `user` 消息前，保护多轮对话历史 KV / Prefix Cache。<br>2. **时序替代链与幂等去重**：`AddFact` 同文本幂等去重、`SupersedeFact` 单事务原子替代（`valid_to` + `superseded_by`）以及 `SearchFacts` 最多 5 跳历史追新。<br>3. **无锁命中统计与休眠治理**：有界非阻塞通道异步批量刷新 `served_count` / `last_served_at`，提供 `SweepDormantUnused`、`MarkQuoteMissing`、`WakeFact` 维护原语及旧库 `PRAGMA table_info` 幂等迁移。 | ✅ 已完成 |
 | **R3.3** | **90 天真实生产运行基准报告** | 在个人工作站与家庭 NAS 上连续运行 EdgeCat + PatchCat，采集真实生产指标（本地 7B 承接率、TTFT 超时降级率、节省的云端 Token 成本、PII 拦截次数），沉淀技术复盘长文。 | **P2** |
 
 ---

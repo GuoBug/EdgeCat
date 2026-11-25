@@ -19,8 +19,8 @@ docs/
     ├── 0002-positioning-and-homelab-governance_zh.md  # ADR-0002: 治理网关定位、家庭/内网共享与安全威胁模型 (ZH)
     ├── 0003-two-stage-request-mutator.md              # ADR-0003: Two-Stage RequestMutator Inbound Hook (EN)
     ├── 0003-two-stage-request-mutator_zh.md           # ADR-0003: 双阶段入站扩展接口 RequestMutator (ZH)
-    ├── 0004-opt-in-layered-memory-plugin.md           # ADR-0004: Opt-In Layered Memory Plugin & HMAC Stable PII Keys (EN)
-    └── 0004-opt-in-layered-memory-plugin_zh.md        # ADR-0004: 可选分层记忆插件与跨请求 HMAC 稳定 PII 键 (ZH)
+    ├── 0004-opt-in-layered-memory-plugin.md           # ADR-0004: Layered Memory, Lifecycle & Two-Zone Prefix Cache (EN)
+    └── 0004-opt-in-layered-memory-plugin_zh.md        # ADR-0004: 分层记忆插件、受治理生命周期与双区注入 (ZH)
 ```
 
 ## Guidelines for Future Agents & Contributors

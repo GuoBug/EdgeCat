@@ -43,6 +43,10 @@ go test -v ./...
   ```bash
   go test -v ./internal/filter
   ```
+- **Opt-In Layered Memory, Two-Zone Prefix-Cache & Temporal Supersede (`R3.2` / `R3.2.1`)**:
+  ```bash
+  go test -v ./internal/memory
+  ```
 - **Static Code Quality Check**:
   ```bash
   gofmt -l .

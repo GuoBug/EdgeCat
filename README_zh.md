@@ -200,8 +200,8 @@ EdgeCat 兼容 **OpenAI ChatCompletion 协议** 的基础对话与工具调用�
 > - [ADR-0001: 采用 OpenAI 兼容协议作为核心通信协议](docs/adr/0001-openai-wire-protocol_zh.md)（OpenAI Wire Protocol 与 OpenAPI 概念辨析）
 > - [ADR-0002: 确立“治理网关本体 + 家庭/小团队内网共享”定位与安全威胁模型](docs/adr/0002-positioning-and-homelab-governance_zh.md)（为什么网关是本体、NAS 局域网共享边界与零落盘威胁模型）
 > - [ADR-0003: 双阶段入站扩展接口 `RequestMutator` 设计](docs/adr/0003-two-stage-request-mutator_zh.md)（`StagePreMask` + `StagePostMask` 插件契约、安全不变量与 Go 挂载示例）
-> - [ADR-0004: 可选分层记忆插件与跨请求 HMAC 稳定 PII 键设计](docs/adr/0004-opt-in-layered-memory-plugin_zh.md)（SQLite 读写双句柄、中文 FTS5 `trigram`、`client_name` 命名空间隔离与 `HMAC-SHA256` 稳定键）
-> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（已完成 Phase 1/1.5/2 与 R3.1/R3.2 全部研发里程碑，以及 R3.3 90 天实测规划）
+> - [ADR-0004: 可选分层记忆插件、受治理生命周期与双区 Prefix-Cache 注入设计](docs/adr/0004-opt-in-layered-memory-plugin_zh.md)（SQLite 读写双句柄、中文 FTS5 `trigram`、双区 Prefix-Cache 保护、时序替代链与冷记忆休眠治理、以及 `HMAC-SHA256` 稳定键）
+> - [EdgeCat 项目需求池与演进路线图 (Roadmap)](docs/roadmap_zh.md)（已完成 Phase 1/1.5/2 与 R3.1/R3.2/R3.2.1 全部研发里程碑，以及 R3.3 90 天实测规划）
 
 ---
 
